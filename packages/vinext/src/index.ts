@@ -682,6 +682,38 @@ function commonjsTransformFilter(
   return undefined;
 }
 
+// The comment patterns vite-plugin-commonjs strips before its own analysis.
+const COMMONJS_BLOCK_COMMENT_RE = /\/\*(.|[\r\n])*?\*\//gm;
+const COMMONJS_LINE_COMMENT_RE = /\/\/.*(?=[\n\r])/g;
+
+/**
+ * Whether a module is already ESM with nothing for vite-plugin-commonjs to
+ * convert: it declares ESM exports and never calls `require()`. Bundled ESM
+ * (e.g. a linked workspace package's dist that inlines a CommonJS dependency)
+ * only mentions `module`/`exports` inside its wrappers, yet the plugin would
+ * still append an export facade that duplicates the module's own exports.
+ */
+function isEsmWithoutRequire(code: string): boolean {
+  if (!/\bexport\b/.test(code)) return false;
+  const uncommented = code
+    .replace(COMMONJS_BLOCK_COMMENT_RE, "")
+    .replace(COMMONJS_LINE_COMMENT_RE, "");
+  if (/\brequire\b/.test(uncommented)) return false;
+  // Plugins have already compiled TS/JSX away by the time this transform runs.
+  let ast: ReturnType<typeof parseAst>;
+  try {
+    ast = parseAst(code);
+  } catch {
+    return false;
+  }
+  return ast.body.some(
+    (statement) =>
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportDefaultDeclaration" ||
+      statement.type === "ExportAllDeclaration",
+  );
+}
+
 function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
   return (
     statement.specifiers !== undefined &&
@@ -2158,19 +2190,37 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // that vite-plugin-commonjs requires to initialize its resolver.
   let transformProjectLocalCommonJs = false;
   let transformBundledCommonJsDependencies = false;
+  let delegatingCommonJsTransform = false;
   const commonJsPlugin = commonjs({
     filter(id: string) {
       // vite-plugin-commonjs's optimizeDeps pre-bundle plugin calls this filter
       // directly, without the transform wrapper below. Reject vinext's own
       // runtime there too: its inlined dependencies (dist/deps) are already ESM,
       // and a second export facade breaks the whole dependency scan.
-      if (isPathInside(__dirname, toSlash(stripViteModuleQuery(id)))) return false;
-      return commonjsTransformFilter(
+      const cleanId = toSlash(stripViteModuleQuery(id));
+      if (isPathInside(__dirname, cleanId)) return false;
+      const decision = commonjsTransformFilter(
         id,
         transformProjectLocalCommonJs,
         transformBundledCommonJsDependencies,
         importMetaUrlCapability.isBundledCommonJsDependencyId,
       );
+      // The pre-bundle plugin reads files itself, so repeat the transform
+      // wrapper's ESM check from disk for files it would otherwise convert.
+      if (
+        decision === undefined &&
+        !delegatingCommonJsTransform &&
+        !cleanId.includes("node_modules")
+      ) {
+        let code: string;
+        try {
+          code = fs.readFileSync(cleanId, "utf-8");
+        } catch {
+          return decision;
+        }
+        if (isEsmWithoutRequire(code)) return false;
+      }
+      return decision;
     },
   });
   const commonJsTransform = commonJsPlugin.transform;
@@ -2224,10 +2274,12 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       );
       if (userCondition === false) return null;
       if (userCondition !== true && id.includes("node_modules")) return null;
+      if (userCondition !== true && isEsmWithoutRequire(code)) return null;
       const previousProjectLocal = transformProjectLocalCommonJs;
       const previous = transformBundledCommonJsDependencies;
       transformProjectLocalCommonJs = projectLocal && isDev;
       transformBundledCommonJsDependencies = bundledDependency;
+      delegatingCommonJsTransform = true;
       try {
         // Do not await here: the filter is consulted synchronously while this
         // environment-scoped flag is set. The remaining async transform work
@@ -2236,6 +2288,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       } finally {
         transformProjectLocalCommonJs = previousProjectLocal;
         transformBundledCommonJsDependencies = previous;
+        delegatingCommonJsTransform = false;
       }
     };
     // Modules without any syntax vite-plugin-commonjs could rewrite never

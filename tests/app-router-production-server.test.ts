@@ -371,6 +371,12 @@ describe("App Router Production server (startProdServer)", () => {
     expect(await res.text()).toContain("loaded from a character-code require");
   });
 
+  it("builds a project-local ESM bundle that inlines CommonJS", async () => {
+    const res = await fetch(`${baseUrl}/cjs/bundled-esm`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/full(<!-- -->)?:(<!-- -->)?1\.0\.0/);
+  });
+
   it("serves static asset byte ranges from the identity representation", async () => {
     const html = await (await fetch(`${baseUrl}/`)).text();
     const href = html.match(/["'](\/_next\/static\/[^"']+\.(?:js|css))["']/)?.[1];
