@@ -210,6 +210,7 @@ import {
   assertNoPublicNextRequestConflict,
 } from "./build/public-dir-conflict.js";
 import { renderVinextBuiltUrl } from "./utils/built-asset-url.js";
+import { walkAst } from "./plugins/ast-utils.js";
 import { asyncHooksStubPlugin } from "./plugins/async-hooks-stub.js";
 import { clientReferenceDedupPlugin } from "./plugins/client-reference-dedup.js";
 import { dataUrlCssPlugin } from "./plugins/css-data-url.js";
@@ -682,23 +683,18 @@ function commonjsTransformFilter(
   return undefined;
 }
 
-// The comment patterns vite-plugin-commonjs strips before its own analysis.
-const COMMONJS_BLOCK_COMMENT_RE = /\/\*(.|[\r\n])*?\*\//gm;
-const COMMONJS_LINE_COMMENT_RE = /\/\/.*(?=[\n\r])/g;
-
 /**
  * Whether a module is already ESM with nothing for vite-plugin-commonjs to
  * convert: it declares ESM exports and never calls `require()`. Bundled ESM
  * (e.g. a linked workspace package's dist that inlines a CommonJS dependency)
  * only mentions `module`/`exports` inside its wrappers, yet the plugin would
  * still append an export facade that duplicates the module's own exports.
+ *
+ * `require()` calls are found the way the plugin's analyzer finds them: any
+ * call whose callee is the identifier `require`.
  */
 function isEsmWithoutRequire(code: string): boolean {
   if (!/\bexport\b/.test(code)) return false;
-  const uncommented = code
-    .replace(COMMONJS_BLOCK_COMMENT_RE, "")
-    .replace(COMMONJS_LINE_COMMENT_RE, "");
-  if (/\brequire\b/.test(uncommented)) return false;
   // Plugins have already compiled TS/JSX away by the time this transform runs.
   let ast: ReturnType<typeof parseAst>;
   try {
@@ -706,12 +702,25 @@ function isEsmWithoutRequire(code: string): boolean {
   } catch {
     return false;
   }
-  return ast.body.some(
+  const hasEsmExport = ast.body.some(
     (statement) =>
       statement.type === "ExportNamedDeclaration" ||
       statement.type === "ExportDefaultDeclaration" ||
       statement.type === "ExportAllDeclaration",
   );
+  if (!hasEsmExport) return false;
+  let callsRequire = false;
+  walkAst(ast, (node) => {
+    if (callsRequire) return false;
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "Identifier" &&
+      node.callee.name === "require"
+    ) {
+      callsRequire = true;
+    }
+  });
+  return !callsRequire;
 }
 
 function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
