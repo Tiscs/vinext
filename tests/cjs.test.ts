@@ -71,6 +71,12 @@ describe("CJS interop (App Router)", () => {
     expect(visibleTextByTestId(html, "cjs-bundled-esm")).toBe("full:1.0.0");
   });
 
+  it("converts free CommonJS exports in a module that also exports ESM", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/cjs/mixed-esm");
+    expect(res.status).toBe(200);
+    expect(visibleTextByTestId(html, "cjs-mixed-esm")).toBe("cjs+esm");
+  });
+
   it("renders page that uses CJS require('server-only')", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/cjs/server-only");
     expect(res.status).toBe(200);

@@ -2,6 +2,7 @@ import type {
   Alias,
   CSSModulesOptions,
   DevEnvironment,
+  ESTree,
   HotUpdateOptions,
   Logger,
   Plugin,
@@ -210,7 +211,8 @@ import {
   assertNoPublicNextRequestConflict,
 } from "./build/public-dir-conflict.js";
 import { renderVinextBuiltUrl } from "./utils/built-asset-url.js";
-import { walkAst } from "./plugins/ast-utils.js";
+import { forEachAstChild } from "./plugins/ast-utils.js";
+import { isFunctionNode } from "./plugins/ast-scope.js";
 import { asyncHooksStubPlugin } from "./plugins/async-hooks-stub.js";
 import { clientReferenceDedupPlugin } from "./plugins/client-reference-dedup.js";
 import { dataUrlCssPlugin } from "./plugins/css-data-url.js";
@@ -683,17 +685,62 @@ function commonjsTransformFilter(
   return undefined;
 }
 
+const COMMONJS_MODULE_NAMES = new Set(["module", "exports"]);
+
+/**
+ * Whether code under `node` uses CommonJS that vite-plugin-commonjs converts:
+ * a call whose callee is the identifier `require` (as the plugin's analyzer
+ * finds them), or a `module`/`exports` reference outside a function that
+ * takes that name as a parameter. Other identifier positions are treated as
+ * references, which only keeps the conversion on.
+ */
+function usesCommonJs(node: ESTree.Node, wrapperParams: ReadonlySet<string>): boolean {
+  if (node.type === "Identifier") {
+    return COMMONJS_MODULE_NAMES.has(node.name) && !wrapperParams.has(node.name);
+  }
+  if (
+    node.type === "CallExpression" &&
+    node.callee.type === "Identifier" &&
+    node.callee.name === "require"
+  ) {
+    return true;
+  }
+  if (node.type === "MemberExpression" && !node.computed) {
+    return usesCommonJs(node.object, wrapperParams);
+  }
+  if (node.type === "Property" && !node.computed) {
+    return usesCommonJs(node.value, wrapperParams);
+  }
+  if (isFunctionNode(node)) {
+    const params = new Set(wrapperParams);
+    for (const param of node.params) {
+      if (param.type === "Identifier" && COMMONJS_MODULE_NAMES.has(param.name)) {
+        params.add(param.name);
+      }
+    }
+    let found = false;
+    forEachAstChild(node, (child) => {
+      if (child.type === "Identifier" && node.params.includes(child)) return;
+      found ||= usesCommonJs(child, params);
+    });
+    return found;
+  }
+  let found = false;
+  forEachAstChild(node, (child) => {
+    found ||= usesCommonJs(child, wrapperParams);
+  });
+  return found;
+}
+
 /**
  * Whether a module is already ESM with nothing for vite-plugin-commonjs to
- * convert: it declares ESM exports and never calls `require()`. Bundled ESM
- * (e.g. a linked workspace package's dist that inlines a CommonJS dependency)
- * only mentions `module`/`exports` inside its wrappers, yet the plugin would
- * still append an export facade that duplicates the module's own exports.
- *
- * `require()` calls are found the way the plugin's analyzer finds them: any
- * call whose callee is the identifier `require`.
+ * convert: it declares ESM exports and uses no CommonJS outside wrappers.
+ * Bundled ESM (e.g. a linked workspace package's dist that inlines a CommonJS
+ * dependency) only mentions `module`/`exports` as its wrappers' parameters,
+ * yet the plugin would still append an export facade that duplicates the
+ * module's own exports.
  */
-function isEsmWithoutRequire(code: string): boolean {
+function isEsmWithoutCommonJs(code: string): boolean {
   if (!/\bexport\b/.test(code)) return false;
   // Plugins have already compiled TS/JSX away by the time this transform runs.
   let ast: ReturnType<typeof parseAst>;
@@ -708,19 +755,7 @@ function isEsmWithoutRequire(code: string): boolean {
       statement.type === "ExportDefaultDeclaration" ||
       statement.type === "ExportAllDeclaration",
   );
-  if (!hasEsmExport) return false;
-  let callsRequire = false;
-  walkAst(ast, (node) => {
-    if (callsRequire) return false;
-    if (
-      node.type === "CallExpression" &&
-      node.callee.type === "Identifier" &&
-      node.callee.name === "require"
-    ) {
-      callsRequire = true;
-    }
-  });
-  return !callsRequire;
+  return hasEsmExport && !usesCommonJs(ast, new Set());
 }
 
 function hasOnlyTypeSpecifiers(statement: AstStaticDependencyDeclaration): boolean {
@@ -2227,7 +2262,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         } catch {
           return decision;
         }
-        if (isEsmWithoutRequire(code)) return false;
+        if (isEsmWithoutCommonJs(code)) return false;
       }
       return decision;
     },
@@ -2283,7 +2318,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       );
       if (userCondition === false) return null;
       if (userCondition !== true && id.includes("node_modules")) return null;
-      if (userCondition !== true && isEsmWithoutRequire(code)) return null;
+      if (userCondition !== true && isEsmWithoutCommonJs(code)) return null;
       const previousProjectLocal = transformProjectLocalCommonJs;
       const previous = transformBundledCommonJsDependencies;
       transformProjectLocalCommonJs = projectLocal && isDev;
