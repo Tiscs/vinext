@@ -71,10 +71,10 @@ describe("CJS interop (App Router)", () => {
     expect(visibleTextByTestId(html, "cjs-bundled-esm")).toBe("full:1.0.0");
   });
 
-  it("converts free CommonJS exports in a module that also exports ESM", async () => {
+  it("keeps require() but not exports.* in a module that also exports ESM", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/cjs/mixed-esm");
     expect(res.status).toBe(200);
-    expect(visibleTextByTestId(html, "cjs-mixed-esm")).toBe("cjs+esm");
+    expect(visibleTextByTestId(html, "cjs-mixed-esm")).toBe("esm");
   });
 
   it("renders page that uses CJS require('server-only')", async () => {
@@ -87,9 +87,9 @@ describe("CJS interop (App Router)", () => {
 
 describe("CJS interop (dependency scan)", () => {
   it("does not add a CommonJS export facade to project-local ESM bundles", async () => {
-    // vite-plugin-commonjs's optimizer plugin loads files itself and consults
-    // only vinext's filter, so the scan must reach the same decision as the
-    // transform for app/cjs/bundled-esm/bundled-semver.js.
+    // vite-plugin-commonjs's optimizer plugin loads and transforms files
+    // without vinext's transform wrapper, so the scan must drop the same export
+    // facade for app/cjs/bundled-esm and app/cjs/mixed-esm.
     const errors: string[] = [];
     const logger = createLogger("silent");
     logger.error = (message) => {
