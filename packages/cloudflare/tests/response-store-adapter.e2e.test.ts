@@ -1015,6 +1015,36 @@ describe("Cloudflare Workers Response Store adapter", () => {
     assert.match(fresh, /^replayed:/);
   });
 
+  test("serves stale unstable_cache siblings while it refreshes them", async () => {
+    const pathname = "/unstable-cache-siblings";
+    const read = async () => {
+      // A replay that regenerates one sibling must not regenerate the other in
+      // the foreground, or each replays the page for the other without end.
+      const body = await Promise.race([
+        cacheStatus(pathname).then((result) => result.body),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${pathname} did not respond within 4s`)), 4_000),
+        ),
+      ]);
+      return [htmlValue(body, "sibling-first"), htmlValue(body, "sibling-second")];
+    };
+    const first = await read();
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Like Next.js, unstable_cache without `expire` never hard-expires: past
+    // `revalidate` it serves the stale value and refreshes it in the background.
+    assert.deepEqual(await read(), first);
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const fresh = await read();
+    assert.notEqual(fresh[0], first[0]);
+    assert.notEqual(fresh[1], first[1]);
+    assert.match(fresh[0], /^first:/);
+    assert.match(fresh[1], /^second:/);
+  }, 15_000);
+
   test("keeps the active response when background regeneration becomes non-cacheable", async () => {
     const pathname = `/api/revalidation-policy?key=${crypto.randomUUID()}`;
     const prepared = await request(pathname, { method: "POST" });

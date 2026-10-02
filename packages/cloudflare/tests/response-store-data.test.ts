@@ -465,6 +465,55 @@ test("rejects a candidate older than the latest soft-tag invalidation", async ()
   }
 });
 
+test("never lets the Store hard-expire an entry it regenerates by replaying the page", async () => {
+  const store = new TestStore();
+  const handler = new WorkersResponseStoreCacheHandler(store);
+  const policy = async (context: Record<string, unknown>) => {
+    await runWithResponseStoreInvocation("route", true, () => handler.set("key", null, context));
+    return store.response?.headers.get("Cache-Control");
+  };
+  const invocation = {
+    encryptedArgs: "encrypted",
+    referenceId: "module#cached",
+    rootParams: {},
+    softTags: [],
+  };
+
+  // unstable_cache and cached fetch pass no `expire`; Next.js serves them stale indefinitely.
+  expect(await policy({ revalidate: 1 })).toBe(
+    "public, max-age=1, stale-while-revalidate=315360000",
+  );
+  expect(await policy({ cacheControl: { revalidate: 1, expire: 2 } })).toBe(
+    "public, max-age=1, stale-while-revalidate=315360000",
+  );
+  // A cache function regenerates without replaying the page, so the Store keeps its expiry.
+  expect(
+    await policy({
+      cacheControl: { revalidate: 1, expire: 2 },
+      cacheFunctionInvocation: invocation,
+    }),
+  ).toBe("public, max-age=1, stale-while-revalidate=1");
+});
+
+test("treats a page-replay entry past its expire as a miss", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(10_000);
+    const store = new TestStore();
+    const handler = new WorkersResponseStoreCacheHandler(store);
+    await runWithResponseStoreInvocation("route", true, () =>
+      handler.set("key", null, { cacheControl: { revalidate: 1, expire: 2 } }),
+    );
+
+    vi.setSystemTime(11_500);
+    await expect(handler.get("key")).resolves.toMatchObject({ value: null });
+    vi.setSystemTime(12_500);
+    await expect(handler.get("key")).resolves.toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("honors a shorter revalidate requested by a later read", async () => {
   vi.useFakeTimers();
   try {
