@@ -708,13 +708,7 @@ function stripEsmExportFacadeInPreBundle(plugin: CommonJsPreBundlePlugin): void 
             build.onLoad(options, async (args) => {
               const result = await load(args);
               if (typeof result?.contents !== "string") return result;
-              const contents = stripEsmCommonJsExportFacade(result.contents, () => {
-                try {
-                  return fs.readFileSync(args.path, "utf8");
-                } catch {
-                  return undefined;
-                }
-              });
+              const contents = stripEsmCommonJsExportFacade(result.contents);
               return contents === undefined ? result : { ...result, contents };
             }),
         },
@@ -2282,7 +2276,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         if (typeof transformed !== "object" || typeof transformed?.code !== "string") {
           return transformed;
         }
-        const stripped = stripEsmCommonJsExportFacade(transformed.code, () => code);
+        const stripped = stripEsmCommonJsExportFacade(transformed.code);
         return stripped === undefined ? transformed : { ...transformed, code: stripped };
       });
     };

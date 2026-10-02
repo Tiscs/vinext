@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import path from "node:path";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { describe, expect, it } from "vite-plus/test";
 import { stripEsmCommonJsExportFacade } from "../packages/vinext/src/plugins/commonjs-esm-facade.js";
 
 type CommonJsTransform = (code: string, id: string) => Promise<{ code: string } | null | undefined>;
@@ -28,7 +28,7 @@ const id = path.join(FIXTURES_DIR, "module.js");
 async function transformAndStrip(source: string) {
   const output = (await transformCommonJs(source, id))?.code;
   if (output === undefined) throw new Error("vite-plugin-commonjs left the module unchanged");
-  return { output, stripped: stripEsmCommonJsExportFacade(output, () => source) };
+  return { output, stripped: stripEsmCommonJsExportFacade(output) };
 }
 
 describe("stripEsmCommonJsExportFacade", () => {
@@ -79,11 +79,8 @@ describe("stripEsmCommonJsExportFacade", () => {
     expect(stripped).toBeUndefined();
   });
 
-  it("does not read the source when the output has no facade", () => {
-    const readSource = vi.fn(() => `export {};`);
-
-    expect(stripEsmCommonJsExportFacade(`import a from "a";`, readSource)).toBeUndefined();
-    expect(readSource).not.toHaveBeenCalled();
+  it("leaves output without a facade alone", () => {
+    expect(stripEsmCommonJsExportFacade(`export const a = 1;`)).toBeUndefined();
   });
 
   it("keeps code appended after the facade", () => {
@@ -95,7 +92,7 @@ describe("stripEsmCommonJsExportFacade", () => {
       `function __matchRequireRuntime0__(path) {}`,
     ].join("\n");
 
-    expect(stripEsmCommonJsExportFacade(output, () => `export const a = 1;`)).toBe(
+    expect(stripEsmCommonJsExportFacade(output)).toBe(
       `export const a = 1;\n\nfunction __matchRequireRuntime0__(path) {}`,
     );
   });
