@@ -377,7 +377,9 @@ export class WorkersResponseStoreCacheHandler implements CacheHandler {
         age > requestedRevalidate * 1000;
       let cacheState: string | undefined;
       if (response.headers.get(REPLAYABLE_HEADER) === "1") {
-        if (requestedStale) cacheState = "stale";
+        // A stale Store hit has already scheduled the Store's own refresh. Reporting it
+        // stale as well would make the caller (e.g. cached fetch) refresh it a second time.
+        if (requestedStale && storeStatus !== "BLOB-STALE") cacheState = "stale";
       } else if (
         typeof entry.cacheControl?.expire === "number" &&
         age > entry.cacheControl.expire * 1000

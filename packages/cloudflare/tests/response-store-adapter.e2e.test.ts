@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 
-import { Miniflare, type MiniflareOptions } from "miniflare";
+import {
+  fetch as miniflareFetch,
+  Miniflare,
+  Response as MiniflareResponse,
+  type MiniflareOptions,
+  type Request as MiniflareRequest,
+} from "miniflare";
 import { afterEach, beforeEach, describe, test } from "vitest";
 
 const root = path.resolve(import.meta.dirname, "../../..");
@@ -20,6 +26,7 @@ const responseStoreShards = 4;
 
 let miniflare: Miniflare;
 let workerVersionId: string;
+let upstreamRequests = 0;
 
 async function modules(directory: string, entry: string) {
   const files = (await readdir(directory, { recursive: true })).filter((file) =>
@@ -119,6 +126,7 @@ async function waitForResponseEntries(pathname: string, count: number): Promise<
 
 beforeEach(async () => {
   workerVersionId = crypto.randomUUID();
+  upstreamRequests = 0;
   const compatibility = {
     compatibilityDate: "2026-04-08",
     compatibilityFlags: ["nodejs_compat", "experimental"],
@@ -137,6 +145,12 @@ beforeEach(async () => {
         },
         modules: await modules(appOutput, "index.js"),
         name: "app",
+        // Answers the demo's https://upstream.test fetches and counts them.
+        outboundService: (outbound: MiniflareRequest) => {
+          if (new URL(outbound.url).hostname !== "upstream.test") return miniflareFetch(outbound);
+          upstreamRequests += 1;
+          return new MiniflareResponse(`upstream:${upstreamRequests}`);
+        },
         serviceBindings: {
           ASSETS: async () => new Response(null, { status: 404 }),
           RESPONSE_STORE: { entrypoint: "ResponseStoreService", name: "cache" },
@@ -1044,6 +1058,21 @@ describe("Cloudflare Workers Response Store adapter", () => {
     assert.match(fresh[0], /^first:/);
     assert.match(fresh[1], /^second:/);
   }, 15_000);
+
+  test("refreshes a stale cached fetch once", async () => {
+    const pathname = "/fetch-cache-swr";
+    const read = async () => htmlValue((await cacheStatus(pathname)).body, "fetch-cache-value");
+    assert.equal(await read(), "upstream:1");
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // The stale read schedules the Store's page replay, which fetches upstream once.
+    // The fetch shim must not refresh the same entry a second time.
+    assert.equal(await read(), "upstream:1");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(await read(), "upstream:2");
+    assert.equal(upstreamRequests, 2);
+  });
 
   test("keeps the active response when background regeneration becomes non-cacheable", async () => {
     const pathname = `/api/revalidation-policy?key=${crypto.randomUUID()}`;

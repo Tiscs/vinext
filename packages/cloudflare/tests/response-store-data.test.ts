@@ -482,6 +482,29 @@ test("stores data entries without expire as stale indefinitely, like Next.js", a
   );
 });
 
+test("leaves a stale replayable hit to the Store's own refresh", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(10_000);
+    const store = new TestStore();
+    const handler = new WorkersResponseStoreCacheHandler(store);
+    await runWithResponseStoreInvocation("route", true, () =>
+      handler.set("key", null, { revalidate: 60 }),
+    );
+
+    vi.setSystemTime(12_000);
+    // A fresh Store hit older than a shorter requested revalidate is still stale for the caller.
+    await expect(handler.get("key", { revalidate: 1 })).resolves.toMatchObject({
+      cacheState: "stale",
+    });
+    // A stale Store hit has already scheduled the Store's refresh.
+    store.response?.headers.set("X-Workers-Response-Store", "BLOB-STALE");
+    await expect(handler.get("key", { revalidate: 1 })).resolves.not.toHaveProperty("cacheState");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("honors a shorter revalidate requested by a later read", async () => {
   vi.useFakeTimers();
   try {
