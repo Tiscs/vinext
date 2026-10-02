@@ -252,13 +252,11 @@ function renderPagePayloadToStream(payload: unknown): ReadableStream<Uint8Array>
       didRender = true;
       const pageElement = findPageElement(payload);
       // Flight renders every entry, so the head resolves during the render.
-      // Its outlet awaits generateMetadata() and generateViewport(); a
-      // rejection surfaces in its Flight row, not as a stream error.
+      // Its outlet awaits generateMetadata() and generateViewport(). None of
+      // these tests expects a head error, so a rejection fails the render.
       const [text] = await Promise.all([
         pageElement ? renderReactNodeText(pageElement) : "",
-        ...findMetadataOutletElements(payload).map((outlet) =>
-          renderReactNodeText(outlet).catch(() => ""),
-        ),
+        ...findMetadataOutletElements(payload).map((outlet) => renderReactNodeText(outlet)),
       ]);
       controller.enqueue(new TextEncoder().encode(text));
       controller.close();
