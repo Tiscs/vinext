@@ -1,3 +1,4 @@
+import { signalFromNodeResponse } from "./node-response-signal.js";
 /**
  * Production server for vinext.
  *
@@ -1127,6 +1128,7 @@ function nodeToWebRequest(
   prerenderSecret?: string,
   i18nConfig?: NextI18nConfig | null,
   authorizeOnDemandRevalidate?: (headerValue: string | null) => boolean,
+  signal?: AbortSignal,
 ): Request {
   const proto = resolveRequestProtocol(req);
   const rawHeaders = nodeHeadersToWebHeaders(req.headers);
@@ -1166,6 +1168,7 @@ function nodeToWebRequest(
   const init: RequestInit & { duplex?: string } = {
     method,
     headers,
+    signal,
   };
 
   if (hasBody) {
@@ -1863,6 +1866,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         prerenderSecret,
         appRouterI18nConfig,
         appRouterAuthorizeOnDemandRevalidate,
+        signalFromNodeResponse(res),
       );
       const ctx = createNodeExecutionContext(resolveTrustedNodeRevalidateOrigin(req, host, port));
       const recorded: { marker?: PrerenderSpecialErrorMarker } = {};
@@ -1872,6 +1876,10 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         };
       }
       const response = await rscHandler(request, ctx);
+      if (request.signal.aborted) {
+        cancelResponseBody(response);
+        return;
+      }
 
       const staticFileSignal = readStaticFileSignal(response);
       if (staticFileSignal) {
@@ -2319,6 +2327,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const webRequest = new Request(`${protocol}://${revalidationHostname ?? hostHeader}${url}`, {
         method,
         headers: reqHeaders,
+        signal: signalFromNodeResponse(res),
         body: hasBody ? readNodeStream(req) : undefined,
         // @ts-expect-error — duplex needed for streaming request bodies
         duplex: hasBody ? "half" : undefined,
