@@ -220,13 +220,15 @@ function createEdgeApiRequest(
   }
   const query = mergeRouteParamsIntoQuery(parseQueryString(url), params);
   requestUrl.search = urlQueryToSearchParams(query).toString();
-  const body = readEdgeRequestBody(req);
+  // Match prod/Next.js: edge API handlers observe client disconnects, and an
+  // already-aborted request carries no body.
+  const signal = signalFromNodeResponse(res);
+  const body = signal.aborted ? undefined : readEdgeRequestBody(req);
 
   const init: RequestInit & { duplex?: "half" } = {
     headers,
     method: req.method,
-    // Match prod/Next.js: edge API handlers observe client disconnects.
-    signal: signalFromNodeResponse(res),
+    signal,
   };
 
   if (body) {

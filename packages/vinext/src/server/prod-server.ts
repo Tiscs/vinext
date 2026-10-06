@@ -1203,7 +1203,9 @@ function nodeToWebRequest(
     signal,
   };
 
-  if (hasBody) {
+  // Match Next.js: a request that is already aborted carries no body, since
+  // its stream may never settle.
+  if (hasBody && !signal?.aborted) {
     init.body = readNodeStream(req);
     init.duplex = "half"; // Required for streaming request bodies
   }
@@ -2355,11 +2357,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const reqHeaders = filterInternalHeaders(rawReqHeaders);
       if (revalidationHostname) reqHeaders.set("host", revalidationHostname);
       const method = req.method ?? "GET";
-      const hasBody = method !== "GET" && method !== "HEAD";
+      const signal = signalFromNodeResponse(res);
+      // Match Next.js: an already-aborted request carries no body.
+      const hasBody = method !== "GET" && method !== "HEAD" && !signal.aborted;
       const webRequest = new Request(`${protocol}://${revalidationHostname ?? hostHeader}${url}`, {
         method,
         headers: reqHeaders,
-        signal: signalFromNodeResponse(res),
+        signal,
         body: hasBody ? readNodeStream(req) : undefined,
         // @ts-expect-error — duplex needed for streaming request bodies
         duplex: hasBody ? "half" : undefined,
