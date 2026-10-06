@@ -8571,13 +8571,14 @@ async function writeWebResponseToNodeRes(
   }
 
   if (response.body) {
-    const { Readable } = await import("node:stream");
+    const { Readable, pipeline } = await import("node:stream");
     const nodeStream = Readable.fromWeb(response.body as import("stream/web").ReadableStream);
+    // pipeline() destroys (and so cancels) the body when the client disconnects.
     await new Promise<void>((resolve, reject) => {
-      nodeStream.on("error", reject);
-      res.on("error", reject);
-      nodeStream.pipe(res);
-      nodeStream.on("end", resolve);
+      pipeline(nodeStream, res, (error) => {
+        if (error && error.code !== "ERR_STREAM_PREMATURE_CLOSE") reject(error);
+        else resolve();
+      });
     });
   } else {
     res.end();

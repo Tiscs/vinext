@@ -104,8 +104,8 @@ async function startHangingUpstream() {
 type ProbeTarget = {
   name: string;
   path: string;
-  /** How the server sends a streamed body: live, buffered first, or not tested. */
-  body: "streamed" | "buffered" | null;
+  /** Whether the server sends a streamed body live or buffers it first. */
+  body: "streamed" | "buffered";
   /** Whether the fixture middleware can override a request header for this path. */
   override: boolean;
 };
@@ -161,7 +161,7 @@ const PAGES_EDGE_API_PROBE: ProbeTarget = {
 const PAGES_MIDDLEWARE_PROBE: ProbeTarget = {
   name: "middleware",
   path: "/middleware-request-signal",
-  body: null,
+  body: "streamed",
   override: false,
 };
 
@@ -237,20 +237,16 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
         .toMatchObject(aborted);
     }, 30_000);
 
-    it.runIf(body !== null)(
-      "aborts and cancels the body when the client disconnects during a streamed response",
-      async () => {
-        const id = randomUUID();
-        await disconnectMidRequest(baseUrl, probePath, id, {
-          query: "mode=stream",
-          waitFor: body === "streamed" ? "chunk" : "probe",
-        });
-        await expect
-          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-          .toMatchObject({ ...aborted, cancelled: true });
-      },
-      30_000,
-    );
+    it("aborts and cancels the body when the client disconnects during a streamed response", async () => {
+      const id = randomUUID();
+      await disconnectMidRequest(baseUrl, probePath, id, {
+        query: "mode=stream",
+        waitFor: body === "streamed" ? "chunk" : "probe",
+      });
+      await expect
+        .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+        .toMatchObject({ ...aborted, cancelled: true });
+    }, 30_000);
 
     it.runIf(override)(
       "still aborts after middleware overrides request headers",
