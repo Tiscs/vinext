@@ -28,6 +28,7 @@ import {
 import { resolveRequestProtocol, resolveRequestHost } from "./proxy-trust.js";
 import { performOnDemandRevalidate, type RevalidateOptions } from "./pages-revalidate.js";
 import { NextRequest } from "vinext/shims/server";
+import { signalFromNodeResponse } from "./node-response-signal.js";
 import { hasBasePath } from "../utils/base-path.js";
 import {
   attachPagesPreviewApi,
@@ -181,6 +182,7 @@ function readEdgeRequestBody(req: IncomingMessage): ReadableStream<Uint8Array> |
 
 function createEdgeApiRequest(
   req: IncomingMessage,
+  res: ServerResponse,
   url: string,
   params: Record<string, string | string[]>,
   nextConfig?: { basePath?: string },
@@ -223,6 +225,8 @@ function createEdgeApiRequest(
   const init: RequestInit & { duplex?: "half" } = {
     headers,
     method: req.method,
+    // Match prod/Next.js: edge API handlers observe client disconnects.
+    signal: signalFromNodeResponse(res),
   };
 
   if (body) {
@@ -406,7 +410,7 @@ export async function handleApiRoute(
       // edge API handlers, so handlers can use `req.nextUrl.searchParams`,
       // `req.cookies`, etc. (Cf. NextRequestHint in next/src/server/web/adapter.ts.)
       const nextRequest = new NextRequest(
-        createEdgeApiRequest(req, url, params, nextConfig),
+        createEdgeApiRequest(req, res, url, params, nextConfig),
         nextConfig
           ? {
               nextConfig: {

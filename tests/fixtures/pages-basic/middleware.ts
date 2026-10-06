@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { handleRequestSignalProbe } from "./lib/request-signal-probe";
 
 export function middleware(request: NextRequest) {
   const url = new URL(request.url);
+
+  // Client-disconnect coverage: tests/node-request-cancellation.test.ts
+  if (url.pathname === "/middleware-request-signal") {
+    return handleRequestSignalProbe(request);
+  }
 
   if (
     url.pathname === "/revalidate-middleware-sentinel" &&

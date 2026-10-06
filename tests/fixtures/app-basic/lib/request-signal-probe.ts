@@ -1,0 +1,83 @@
+// Records whether a request's AbortSignal fired, so client-disconnect tests
+// (tests/node-request-cancellation.test.ts) can observe it through a status
+// request. Modelled on Next.js: test/e2e/cancel-request/
+// https://github.com/vercel/next.js/tree/v16.2.6/test/e2e/cancel-request
+
+type RequestSignalProbe = { aborted: boolean; reason: string | null };
+
+const PROBES_KEY = Symbol.for("vinext.test.requestSignalProbes");
+
+function probes(): Map<string, RequestSignalProbe> {
+  const existing: unknown = Reflect.get(globalThis, PROBES_KEY);
+  if (existing instanceof Map) return existing;
+  const created = new Map<string, RequestSignalProbe>();
+  Reflect.set(globalThis, PROBES_KEY, created);
+  return created;
+}
+
+function reasonName(reason: unknown): string | null {
+  if (!reason || typeof reason !== "object") return null;
+  const name: unknown = Reflect.get(reason, "name");
+  return typeof name === "string" ? name : null;
+}
+
+/**
+ * `?mode=status&id=<id>` reports the probe recorded for `<id>`.
+ * `?mode=hang` holds the response until the request signal aborts.
+ * `?mode=stream` streams one event and then stays open.
+ * Any other mode responds immediately.
+ */
+export async function handleRequestSignalProbe(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const id = url.searchParams.get("id") ?? "";
+  const mode = url.searchParams.get("mode");
+  if (mode === "status") {
+    return Response.json(probes().get(id) ?? null, {
+      headers: { "cache-control": "no-store" },
+    });
+  }
+
+  // Consume the body first so a finished request body cannot be mistaken for
+  // a client disconnect.
+  if (request.method === "POST") await request.text();
+
+  const { signal } = request;
+  const probe: RequestSignalProbe = { aborted: false, reason: null };
+  probes().set(id, probe);
+  const aborted = new Promise<void>((resolve) => {
+    const onAbort = () => {
+      probe.aborted = true;
+      probe.reason = reasonName(signal.reason);
+      resolve();
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  if (mode === "hang") {
+    // Give up eventually so a missing abort fails the test instead of leaving
+    // the request pending forever.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      aborted,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 5000);
+      }),
+    ]);
+    clearTimeout(timer);
+    return new Response("done", { headers: { "cache-control": "no-store" } });
+  }
+
+  if (mode === "stream") {
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("data: start\n\n"));
+        },
+      }),
+      { headers: { "cache-control": "no-store", "content-type": "text/event-stream" } },
+    );
+  }
+
+  return new Response("ok", { headers: { "cache-control": "no-store" } });
+}

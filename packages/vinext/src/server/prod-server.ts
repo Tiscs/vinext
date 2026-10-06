@@ -1,4 +1,3 @@
-import { signalFromNodeResponse } from "./node-response-signal.js";
 /**
  * Production server for vinext.
  *
@@ -28,6 +27,7 @@ import fsp from "node:fs/promises";
 import path from "pathslash";
 import zlib from "node:zlib";
 import { StaticFileCache, contentTypeForPath, etagFromFilenameHash } from "./static-file-cache.js";
+import { signalFromNodeResponse } from "./node-response-signal.js";
 import {
   isImageOptimizationPath,
   IMAGE_CONTENT_SECURITY_POLICY,

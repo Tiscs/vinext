@@ -1,4 +1,3 @@
-import { signalFromNodeResponse } from "./server/node-response-signal.js";
 import type {
   Alias,
   CSSModulesOptions,
@@ -50,6 +49,7 @@ import {
 } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
+import { signalFromNodeResponse } from "./server/node-response-signal.js";
 import {
   DEFAULT_DEVICE_SIZES,
   DEFAULT_IMAGE_SIZES,
