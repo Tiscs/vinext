@@ -265,6 +265,7 @@ function waitForWritableDrain(res: ServerResponse): Promise<void> {
 async function writeEdgeApiResponseBody(
   res: ServerResponse,
   body: ReadableStream<Uint8Array> | null,
+  signal: AbortSignal,
 ): Promise<void> {
   if (!body) {
     res.end();
@@ -272,6 +273,14 @@ async function writeEdgeApiResponseBody(
   }
 
   const reader = body.getReader();
+  // A stalled body would otherwise keep the read pending after the client left.
+  const cancel = () => {
+    reader.cancel(signal.reason).catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+  };
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
   try {
     while (true) {
       const result = await reader.read();
@@ -281,11 +290,14 @@ async function writeEdgeApiResponseBody(
         await waitForWritableDrain(res);
       }
     }
-    res.end();
+    if (!signal.aborted) res.end();
   } catch (error) {
+    // A client disconnect is not a route error.
+    if (signal.aborted) return;
     res.destroy(error instanceof Error ? error : new Error(String(error)));
     throw error;
   } finally {
+    signal.removeEventListener("abort", cancel);
     reader.releaseLock();
   }
 }
@@ -438,7 +450,7 @@ export async function handleApiRoute(
       if (setCookieHeaders.length) {
         res.setHeader("set-cookie", setCookieHeaders);
       }
-      await writeEdgeApiResponseBody(res, response.body);
+      await writeEdgeApiResponseBody(res, response.body, nextRequest.signal);
       return true;
     }
 

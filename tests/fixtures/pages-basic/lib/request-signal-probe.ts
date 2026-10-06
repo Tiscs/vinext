@@ -3,7 +3,16 @@
 // request. Modelled on Next.js: test/e2e/cancel-request/
 // https://github.com/vercel/next.js/tree/v16.2.6/test/e2e/cancel-request
 
-type RequestSignalProbe = { aborted: boolean; reason: string | null };
+type RequestSignalProbe = {
+  aborted: boolean;
+  reason: string | null;
+  /** Whether the response body stream was cancelled. */
+  cancelled: boolean;
+  /** Whether a middleware request-header override reached the handler. */
+  overridden: boolean;
+};
+
+export const REQUEST_SIGNAL_OVERRIDE_HEADER = "x-request-signal-override";
 
 const PROBES_KEY = Symbol.for("vinext.test.requestSignalProbes");
 
@@ -26,6 +35,7 @@ function reasonName(reason: unknown): string | null {
  * `?mode=hang` holds the response until the request signal aborts.
  * `?mode=stream` streams one event and then stays open.
  * Any other mode responds immediately.
+ * `?override` asks the fixture middleware to override a request header first.
  */
 export async function handleRequestSignalProbe(request: Request): Promise<Response> {
   const url = new URL(request.url);
@@ -42,7 +52,12 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
   if (request.method === "POST") await request.text();
 
   const { signal } = request;
-  const probe: RequestSignalProbe = { aborted: false, reason: null };
+  const probe: RequestSignalProbe = {
+    aborted: false,
+    reason: null,
+    cancelled: false,
+    overridden: request.headers.get(REQUEST_SIGNAL_OVERRIDE_HEADER) === "1",
+  };
   probes().set(id, probe);
   const aborted = new Promise<void>((resolve) => {
     const onAbort = () => {
@@ -73,6 +88,9 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
       new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(new TextEncoder().encode("data: start\n\n"));
+        },
+        cancel() {
+          probe.cancelled = true;
         },
       }),
       { headers: { "cache-control": "no-store", "content-type": "text/event-stream" } },

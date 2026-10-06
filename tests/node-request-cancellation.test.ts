@@ -19,7 +19,12 @@ import {
 // (signalFromNodeResponse): it aborts with `ResponseAborted` when the response
 // closes before finishing, and never after a normally completed response.
 
-type Probe = { aborted: boolean; reason: string | null } | null;
+type Probe = {
+  aborted: boolean;
+  reason: string | null;
+  cancelled: boolean;
+  overridden: boolean;
+} | null;
 
 async function readProbe(baseUrl: string, probePath: string, id: string): Promise<Probe> {
   const response = await fetch(`${baseUrl}${probePath}?mode=status&id=${id}`);
@@ -27,25 +32,28 @@ async function readProbe(baseUrl: string, probePath: string, id: string): Promis
   return (await response.json()) as Probe;
 }
 
-/** Open a request, wait until the handler is running (or streaming), then drop the socket. */
+/**
+ * Open a request, wait until the handler is running (or, with `waitFor:
+ * "chunk"`, until the first streamed bytes arrive), then drop the socket.
+ */
 async function disconnectMidRequest(
   baseUrl: string,
   probePath: string,
   id: string,
-  mode: "hang" | "stream",
+  { query, waitFor }: { query: string; waitFor: "chunk" | "probe" },
 ): Promise<void> {
-  const client = http.request(`${baseUrl}${probePath}?mode=${mode}&id=${id}`);
+  const client = http.request(`${baseUrl}${probePath}?${query}&id=${id}`);
   client.on("error", () => {});
   const firstChunk = new Promise<void>((resolve) => {
     client.on("response", (res) => res.once("data", () => resolve()));
   });
   client.end();
-  if (mode === "stream") {
+  if (waitFor === "chunk") {
     await firstChunk;
   } else {
     await expect
       .poll(() => readProbe(baseUrl, probePath, id), { timeout: 20_000 })
-      .toEqual({ aborted: false, reason: null });
+      .toMatchObject({ aborted: false });
   }
   client.destroy();
 }
@@ -71,13 +79,44 @@ async function completeRequest(baseUrl: string, probePath: string, id: string): 
   });
 }
 
-type ProbeTarget = { name: string; path: string; streams: boolean };
+/** An upstream that never responds and records when its request is torn down. */
+async function startHangingUpstream() {
+  const state = { received: false, closed: false };
+  const server = http.createServer((req, res) => {
+    state.received = true;
+    res.once("close", () => {
+      state.closed = true;
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Expected TCP listener");
+  return {
+    state,
+    url: `http://127.0.0.1:${address.port}/hang`,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+type ProbeTarget = {
+  name: string;
+  path: string;
+  /** How the server sends a streamed body: live, buffered first, or not tested. */
+  body: "streamed" | "buffered" | null;
+  /** Whether the fixture middleware can override a request header for this path. */
+  override: boolean;
+};
 
 type ServerTarget = {
   name: string;
   /** Next.js aborts with `ResponseAborted`; undefined skips the reason check. */
   reason?: string;
   probes: ProbeTarget[];
+  /** Middleware path that proxies to `x-middleware-test-rewrite-target`. */
+  externalRewritePath: string;
   start: () => Promise<{ baseUrl: string; close: () => Promise<void> }>;
 };
 
@@ -107,16 +146,23 @@ async function startDevServer(fixtureDir: string) {
   return { baseUrl, close: () => server.close() };
 }
 
-const APP_ROUTE_PROBE = { name: "route handler", path: "/api/request-signal", streams: true };
-const PAGES_EDGE_API_PROBE = {
+const APP_ROUTE_PROBE: ProbeTarget = {
+  name: "route handler",
+  path: "/api/request-signal",
+  body: "streamed",
+  override: true,
+};
+const PAGES_EDGE_API_PROBE: ProbeTarget = {
   name: "edge API route",
   path: "/api/edge-request-signal",
-  streams: true,
+  body: "streamed",
+  override: true,
 };
-const PAGES_MIDDLEWARE_PROBE = {
+const PAGES_MIDDLEWARE_PROBE: ProbeTarget = {
   name: "middleware",
   path: "/middleware-request-signal",
-  streams: false,
+  body: null,
+  override: false,
 };
 
 const targets: ServerTarget[] = [
@@ -124,31 +170,34 @@ const targets: ServerTarget[] = [
     name: "App Router production",
     reason: "ResponseAborted",
     probes: [APP_ROUTE_PROBE],
+    externalRewritePath: "/middleware-external-rewrite",
     start: async () => startBuiltProdServer(await buildAppFixture(APP_FIXTURE_DIR)),
   },
   {
     // Served by @vitejs/plugin-rsc through srvx, which owns this signal.
     name: "App Router dev",
     probes: [APP_ROUTE_PROBE],
+    externalRewritePath: "/middleware-external-rewrite",
     start: () => startDevServer(APP_FIXTURE_DIR),
   },
   {
     name: "Pages Router production",
     reason: "ResponseAborted",
-    // The Pages production server buffers edge API bodies before sending them,
-    // so there is no mid-stream point at which to disconnect.
-    probes: [{ ...PAGES_EDGE_API_PROBE, streams: false }, PAGES_MIDDLEWARE_PROBE],
+    // The Pages production server buffers edge API bodies before sending them.
+    probes: [{ ...PAGES_EDGE_API_PROBE, body: "buffered" }, PAGES_MIDDLEWARE_PROBE],
+    externalRewritePath: "/external-middleware-rewrite-body",
     start: async () => startBuiltProdServer(await buildPagesFixture(PAGES_FIXTURE_DIR)),
   },
   {
     name: "Pages Router dev",
     reason: "ResponseAborted",
     probes: [PAGES_EDGE_API_PROBE, PAGES_MIDDLEWARE_PROBE],
+    externalRewritePath: "/external-middleware-rewrite-body",
     start: () => startDevServer(PAGES_FIXTURE_DIR),
   },
 ];
 
-describe.each(targets)("$name request.signal", ({ reason, probes, start }) => {
+describe.each(targets)("$name request.signal", ({ reason, probes, externalRewritePath, start }) => {
   let baseUrl: string;
   let close: (() => Promise<void>) | undefined;
 
@@ -162,23 +211,58 @@ describe.each(targets)("$name request.signal", ({ reason, probes, start }) => {
 
   const aborted = reason === undefined ? { aborted: true } : { aborted: true, reason };
 
-  describe.each(probes)("$name", ({ path: probePath, streams }) => {
+  it("stops an external rewrite upstream request when the client disconnects", async () => {
+    const upstream = await startHangingUpstream();
+    try {
+      const client = http.request(`${baseUrl}${externalRewritePath}`, {
+        headers: { "x-middleware-test-rewrite-target": upstream.url },
+      });
+      client.on("error", () => {});
+      client.end();
+      await expect.poll(() => upstream.state.received, { timeout: 20_000 }).toBe(true);
+      client.destroy();
+      // The proxy's own timeout is 30 seconds; the disconnect must win.
+      await expect.poll(() => upstream.state.closed, { timeout: 3_000 }).toBe(true);
+    } finally {
+      await upstream.close();
+    }
+  }, 30_000);
+
+  describe.each(probes)("$name", ({ path: probePath, body, override }) => {
     it("aborts when the client disconnects before the response is sent", async () => {
       const id = randomUUID();
-      await disconnectMidRequest(baseUrl, probePath, id, "hang");
+      await disconnectMidRequest(baseUrl, probePath, id, { query: "mode=hang", waitFor: "probe" });
       await expect
         .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
         .toMatchObject(aborted);
     }, 30_000);
 
-    it.runIf(streams)(
-      "aborts when the client disconnects while the response streams",
+    it.runIf(body !== null)(
+      "aborts and cancels the body when the client disconnects during a streamed response",
       async () => {
         const id = randomUUID();
-        await disconnectMidRequest(baseUrl, probePath, id, "stream");
+        await disconnectMidRequest(baseUrl, probePath, id, {
+          query: "mode=stream",
+          waitFor: body === "streamed" ? "chunk" : "probe",
+        });
         await expect
           .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-          .toMatchObject(aborted);
+          .toMatchObject({ ...aborted, cancelled: true });
+      },
+      30_000,
+    );
+
+    it.runIf(override)(
+      "still aborts after middleware overrides request headers",
+      async () => {
+        const id = randomUUID();
+        await disconnectMidRequest(baseUrl, probePath, id, {
+          query: "mode=hang&override=1",
+          waitFor: "probe",
+        });
+        await expect
+          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+          .toMatchObject({ ...aborted, overridden: true });
       },
       30_000,
     );
@@ -188,7 +272,10 @@ describe.each(targets)("$name request.signal", ({ reason, probes, start }) => {
       expect(await completeRequest(baseUrl, probePath, id)).toBe("ok");
       // Give a wrongly attached request/socket `close` listener time to fire.
       await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(await readProbe(baseUrl, probePath, id)).toEqual({ aborted: false, reason: null });
+      expect(await readProbe(baseUrl, probePath, id)).toMatchObject({
+        aborted: false,
+        reason: null,
+      });
     }, 30_000);
   });
 });

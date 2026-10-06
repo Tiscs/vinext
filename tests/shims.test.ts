@@ -14539,6 +14539,36 @@ describe("proxyExternalRequest", () => {
     }
   });
 
+  it("aborts the upstream fetch silently when the client disconnects", async () => {
+    const { proxyExternalRequest } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+
+    const client = new AbortController();
+    const request = new Request("http://localhost:3000/test", { signal: client.signal });
+
+    const originalFetch = globalThis.fetch;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let upstreamSignal: AbortSignal | undefined;
+    globalThis.fetch = (_url: any, init: any) => {
+      upstreamSignal = init.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      });
+    };
+
+    try {
+      const pending = proxyExternalRequest(request, "https://api.example.com/test");
+      client.abort();
+      const response = await pending;
+      expect(upstreamSignal?.aborted).toBe(true);
+      expect(response.status).toBe(499);
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+      errorSpy.mockRestore();
+    }
+  });
+
   it("strips hop-by-hop headers from upstream response", async () => {
     const { proxyExternalRequest } =
       await import("../packages/vinext/src/config/config-matchers.js");

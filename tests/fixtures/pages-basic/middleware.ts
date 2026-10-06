@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { handleRequestSignalProbe } from "./lib/request-signal-probe";
+import {
+  handleRequestSignalProbe,
+  REQUEST_SIGNAL_OVERRIDE_HEADER,
+} from "./lib/request-signal-probe";
 
 export function middleware(request: NextRequest) {
   const url = new URL(request.url);
@@ -8,6 +11,12 @@ export function middleware(request: NextRequest) {
   // Client-disconnect coverage: tests/node-request-cancellation.test.ts
   if (url.pathname === "/middleware-request-signal") {
     return handleRequestSignalProbe(request);
+  }
+  if (url.pathname === "/api/edge-request-signal") {
+    if (!url.searchParams.has("override")) return NextResponse.next();
+    const headers = new Headers(request.headers);
+    headers.set(REQUEST_SIGNAL_OVERRIDE_HEADER, "1");
+    return NextResponse.next({ request: { headers } });
   }
 
   if (
@@ -311,6 +320,7 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     "/api/edge-search-params",
+    "/api/edge-request-signal",
     "/edge-api-rewrite/:path*",
     "/((?!api|_next|favicon\\.ico|mw-object-gated).*)",
     {

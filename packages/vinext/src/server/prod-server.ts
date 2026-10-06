@@ -507,6 +507,38 @@ function cancelResponseBody(response: Response): void {
   });
 }
 
+/**
+ * Buffer a response body, cancelling it if the client disconnects first so a
+ * stalled stream does not outlive the connection. Resolves null when aborted.
+ */
+async function bufferResponseBodyUntilAborted(
+  response: Response,
+  signal: AbortSignal,
+): Promise<Buffer | null> {
+  const body = response.body;
+  if (!body) return Buffer.alloc(0);
+  const reader = body.getReader();
+  const cancel = () => {
+    reader.cancel(signal.reason).catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+  };
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
+  const chunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      chunks.push(result.value);
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+  return signal.aborted ? null : Buffer.concat(chunks);
+}
+
 type ResponseWithVinextStreamingMetadata = Response & {
   __vinextStreamedHtmlResponse?: boolean;
   __vinextStreamedApiResponse?: boolean;
@@ -2487,6 +2519,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       if (result.type === "response") {
         const { response } = result;
+        if (webRequest.signal.aborted) {
+          cancelResponseBody(response);
+          return;
+        }
         const streamedApi = isVinextStreamedApiResponse(response);
         const shouldStream = isVinextStreamedHtmlResponse(response) || streamedApi;
         // Passthrough responses (middleware short-circuits, external proxies, redirects)
@@ -2508,7 +2544,8 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
           return;
         }
 
-        const responseBody = Buffer.from(await response.arrayBuffer());
+        const responseBody = await bufferResponseBodyUntilAborted(response, webRequest.signal);
+        if (!responseBody) return;
         // render → text/html, api → application/octet-stream (set by the pipeline).
         const ct = response.headers.get("content-type") ?? result.defaultContentType;
         const responseHeaders: Record<string, string | string[]> = {};
