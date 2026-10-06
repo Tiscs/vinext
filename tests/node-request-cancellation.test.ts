@@ -1,8 +1,8 @@
 import http from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
-import type { ViteDevServer } from "vite";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
+import type { Logger, ViteDevServer } from "vite";
 import { startProdServer } from "../packages/vinext/src/server/prod-server.js";
 import {
   APP_FIXTURE_DIR,
@@ -145,7 +145,12 @@ type ServerTarget = {
   probes: ProbeTarget[];
   /** Middleware external rewrites that proxy to `x-middleware-test-rewrite-target`. */
   externalRewrites: ExternalRewrite[];
-  start: () => Promise<{ baseUrl: string; close: () => Promise<void> }>;
+  /**
+   * Middleware path whose response body fails with the same
+   * ERR_STREAM_PREMATURE_CLOSE code Node reports for a client disconnect.
+   */
+  truncatedBodyPath?: string;
+  start: () => Promise<{ baseUrl: string; close: () => Promise<void>; logger?: Logger }>;
 };
 
 async function startBuiltProdServer(entryPath: string) {
@@ -171,7 +176,7 @@ async function startBuiltProdServer(entryPath: string) {
 async function startDevServer(fixtureDir: string) {
   const { server, baseUrl }: { server: ViteDevServer; baseUrl: string } =
     await startFixtureServer(fixtureDir);
-  return { baseUrl, close: () => server.close() };
+  return { baseUrl, close: () => server.close(), logger: server.config.logger };
 }
 
 const APP_ROUTE_PROBE: ProbeTarget = {
@@ -225,116 +230,152 @@ const targets: ServerTarget[] = [
     // The Pages dev middleware request carries no body.
     probes: [PAGES_EDGE_API_PROBE, { ...PAGES_MIDDLEWARE_PROBE, upload: false }],
     externalRewrites: PAGES_EXTERNAL_REWRITES,
+    truncatedBodyPath: "/middleware-truncated-body",
     start: () => startDevServer(PAGES_FIXTURE_DIR),
   },
 ];
 
-describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrites, start }) => {
-  let baseUrl: string;
-  let close: (() => Promise<void>) | undefined;
+describe.each(targets)(
+  "$name request.signal",
+  ({ reason, probes, externalRewrites, truncatedBodyPath, start }) => {
+    let baseUrl: string;
+    let close: (() => Promise<void>) | undefined;
+    let logger: Logger | undefined;
 
-  beforeAll(async () => {
-    ({ baseUrl, close } = await start());
-    // Compile each probe route up front: dev servers can hold requests to a
-    // cold route, which would delay the readiness polls below.
-    for (const probe of probes) {
-      expect(await readProbe(baseUrl, probe.path, "warmup")).toBeNull();
-    }
-  }, 120_000);
-
-  afterAll(async () => {
-    await close?.();
-  });
-
-  const aborted = reason === undefined ? { aborted: true } : { aborted: true, reason };
-
-  it.each(externalRewrites)(
-    "stops $name upstream request when the client disconnects",
-    async ({ path: rewritePath, headers }) => {
-      const upstream = await startHangingUpstream();
-      try {
-        const client = http.request(`${baseUrl}${rewritePath}`, {
-          headers: { ...headers, "x-middleware-test-rewrite-target": upstream.url },
-        });
-        client.on("error", () => {});
-        client.end();
-        await expect.poll(() => upstream.state.received, { timeout: 20_000 }).toBe(true);
-        client.destroy();
-        // The proxy's own timeout is 30 seconds; the disconnect must win.
-        await expect.poll(() => upstream.state.closed, { timeout: 3_000 }).toBe(true);
-      } finally {
-        await upstream.close();
+    beforeAll(async () => {
+      ({ baseUrl, close, logger } = await start());
+      // Compile each probe route up front: dev servers can hold requests to a
+      // cold route, which would delay the readiness polls below.
+      for (const probe of probes) {
+        expect(await readProbe(baseUrl, probe.path, "warmup")).toBeNull();
       }
-    },
-    30_000,
-  );
+    }, 120_000);
 
-  describe.each(probes)("$name", ({ path: probePath, body, override, upload }) => {
-    it("aborts when the client disconnects before the response is sent", async () => {
-      const id = randomUUID();
-      await disconnectMidRequest(baseUrl, probePath, id, { query: "mode=hang", waitFor: "probe" });
-      // The handler then returns a streamed body, which must be discarded.
-      await expect
-        .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-        .toMatchObject({ ...aborted, timedOut: false, cancelled: true });
-    }, 30_000);
+    afterAll(async () => {
+      await close?.();
+    });
 
-    it("aborts and cancels the body when the client disconnects during a streamed response", async () => {
-      const id = randomUUID();
-      await disconnectMidRequest(baseUrl, probePath, id, {
-        query: "mode=stream",
-        waitFor: body === "streamed" ? "chunk" : "probe",
-      });
-      await expect
-        .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-        .toMatchObject({ ...aborted, cancelled: true });
-    }, 30_000);
+    const aborted = reason === undefined ? { aborted: true } : { aborted: true, reason };
 
-    it.runIf(override)(
-      "still aborts after middleware overrides request headers",
+    it.each(externalRewrites)(
+      "stops $name upstream request when the client disconnects",
+      async ({ path: rewritePath, headers }) => {
+        const upstream = await startHangingUpstream();
+        try {
+          const client = http.request(`${baseUrl}${rewritePath}`, {
+            headers: { ...headers, "x-middleware-test-rewrite-target": upstream.url },
+          });
+          client.on("error", () => {});
+          client.end();
+          await expect.poll(() => upstream.state.received, { timeout: 20_000 }).toBe(true);
+          client.destroy();
+          // The proxy's own timeout is 30 seconds; the disconnect must win.
+          await expect.poll(() => upstream.state.closed, { timeout: 3_000 }).toBe(true);
+        } finally {
+          await upstream.close();
+        }
+      },
+      30_000,
+    );
+
+    it.runIf(truncatedBodyPath !== undefined)(
+      "reports a response body that fails while the client is still connected",
       async () => {
+        if (!logger) throw new Error("Expected a dev server logger");
+        const logError = vi.spyOn(logger, "error").mockImplementation(() => {});
+        try {
+          await fetch(`${baseUrl}${truncatedBodyPath}`)
+            .then((response) => response.text())
+            .catch(() => {});
+          await expect
+            .poll(() => logError.mock.calls.map(([message]) => message).join("\n"), {
+              timeout: 3_000,
+            })
+            .toContain("Premature close");
+        } finally {
+          logError.mockRestore();
+        }
+      },
+      30_000,
+    );
+
+    describe.each(probes)("$name", ({ path: probePath, body, override, upload }) => {
+      it("aborts when the client disconnects before the response is sent", async () => {
         const id = randomUUID();
         await disconnectMidRequest(baseUrl, probePath, id, {
-          query: "mode=hang&override=1",
+          query: "mode=hang",
           waitFor: "probe",
         });
+        // The handler then returns a streamed body, which must be discarded.
         await expect
           .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-          .toMatchObject({ ...aborted, timedOut: false, overridden: true });
-      },
-      30_000,
-    );
+          .toMatchObject({ ...aborted, timedOut: false, cancelled: true });
+      }, 30_000);
 
-    it.runIf(upload)(
-      "aborts while the request body is still uploading when the client disconnects",
-      async () => {
+      it("aborts and cancels the body when the client disconnects during a streamed response", async () => {
         const id = randomUUID();
-        const client = http.request(`${baseUrl}${probePath}?mode=hang&id=${id}`, {
-          method: "POST",
-          headers: { "content-length": "100000", "content-type": "text/plain" },
-        });
-        client.on("error", () => {});
-        client.write("partial");
-        await expect
-          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 20_000 })
-          .toMatchObject({ aborted: false, uploading: true });
-        client.destroy();
-        await expect
-          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-          .toMatchObject({ ...aborted, abortedWhileUploading: true });
-      },
-      30_000,
-    );
+        const logError = logger ? vi.spyOn(logger, "error") : undefined;
+        try {
+          await disconnectMidRequest(baseUrl, probePath, id, {
+            query: "mode=stream",
+            waitFor: body === "streamed" ? "chunk" : "probe",
+          });
+          await expect
+            .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+            .toMatchObject({ ...aborted, cancelled: true });
+          // A client disconnect is not a server error.
+          expect(logError?.mock.calls ?? []).toEqual([]);
+        } finally {
+          logError?.mockRestore();
+        }
+      }, 30_000);
 
-    it("does not abort after a request body is read and the response completes", async () => {
-      const id = randomUUID();
-      expect(await completeRequest(baseUrl, probePath, id)).toBe("ok");
-      // Give a wrongly attached request/socket `close` listener time to fire.
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(await readProbe(baseUrl, probePath, id)).toMatchObject({
-        aborted: false,
-        reason: null,
-      });
-    }, 30_000);
-  });
-});
+      it.runIf(override)(
+        "still aborts after middleware overrides request headers",
+        async () => {
+          const id = randomUUID();
+          await disconnectMidRequest(baseUrl, probePath, id, {
+            query: "mode=hang&override=1",
+            waitFor: "probe",
+          });
+          await expect
+            .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+            .toMatchObject({ ...aborted, timedOut: false, overridden: true });
+        },
+        30_000,
+      );
+
+      it.runIf(upload)(
+        "aborts while the request body is still uploading when the client disconnects",
+        async () => {
+          const id = randomUUID();
+          const client = http.request(`${baseUrl}${probePath}?mode=hang&id=${id}`, {
+            method: "POST",
+            headers: { "content-length": "100000", "content-type": "text/plain" },
+          });
+          client.on("error", () => {});
+          client.write("partial");
+          await expect
+            .poll(() => readProbe(baseUrl, probePath, id), { timeout: 20_000 })
+            .toMatchObject({ aborted: false, uploading: true });
+          client.destroy();
+          await expect
+            .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+            .toMatchObject({ ...aborted, abortedWhileUploading: true });
+        },
+        30_000,
+      );
+
+      it("does not abort after a request body is read and the response completes", async () => {
+        const id = randomUUID();
+        expect(await completeRequest(baseUrl, probePath, id)).toBe("ok");
+        // Give a wrongly attached request/socket `close` listener time to fire.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(await readProbe(baseUrl, probePath, id)).toMatchObject({
+          aborted: false,
+          reason: null,
+        });
+      }, 30_000);
+    });
+  },
+);

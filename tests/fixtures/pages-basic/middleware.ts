@@ -12,6 +12,18 @@ export function middleware(request: NextRequest) {
   if (url.pathname === "/middleware-request-signal") {
     return handleRequestSignalProbe(request);
   }
+  if (url.pathname === "/middleware-truncated-body") {
+    // Ends early with the code Node also uses for a client disconnect.
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(
+            Object.assign(new Error("Premature close"), { code: "ERR_STREAM_PREMATURE_CLOSE" }),
+          );
+        },
+      }),
+    );
+  }
   if (url.pathname === "/api/edge-request-signal") {
     if (!url.searchParams.has("override")) return NextResponse.next();
     const headers = new Headers(request.headers);
