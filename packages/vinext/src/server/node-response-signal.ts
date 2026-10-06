@@ -3,7 +3,7 @@ import type { Writable } from "node:stream";
 // Ported from Next.js: packages/next/src/server/web/spec-extension/adapters/next-request.ts
 // https://github.com/vercel/next.js/blob/v16.2.6/packages/next/src/server/web/spec-extension/adapters/next-request.ts
 
-export const ResponseAbortedName = "ResponseAborted";
+const ResponseAbortedName = "ResponseAborted";
 export class ResponseAborted extends Error {
   public readonly name = ResponseAbortedName;
 }
