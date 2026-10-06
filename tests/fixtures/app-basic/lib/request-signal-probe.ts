@@ -12,6 +12,10 @@ type RequestSignalProbe = {
   overridden: boolean;
   /** Whether `?mode=hang` gave up waiting instead of observing the abort. */
   timedOut: boolean;
+  /** Whether a POST body is still being read. */
+  uploading: boolean;
+  /** Whether the signal aborted while the POST body was still being read. */
+  abortedWhileUploading: boolean;
 };
 
 export const REQUEST_SIGNAL_OVERRIDE_HEADER = "x-request-signal-override";
@@ -65,10 +69,6 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
     });
   }
 
-  // Consume the body first so a finished request body cannot be mistaken for
-  // a client disconnect.
-  if (request.method === "POST") await request.text();
-
   const { signal } = request;
   const probe: RequestSignalProbe = {
     aborted: false,
@@ -76,17 +76,33 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
     cancelled: false,
     overridden: request.headers.get(REQUEST_SIGNAL_OVERRIDE_HEADER) === "1",
     timedOut: false,
+    uploading: false,
+    abortedWhileUploading: false,
   };
   probes().set(id, probe);
   const aborted = new Promise<void>((resolve) => {
     const onAbort = () => {
       probe.aborted = true;
       probe.reason = reasonName(signal.reason);
+      probe.abortedWhileUploading = probe.uploading;
       resolve();
     };
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   });
+
+  // Read any body after registering, so a disconnect mid-upload is recorded
+  // and a finished body read cannot be mistaken for a client disconnect.
+  if (request.method === "POST") {
+    probe.uploading = true;
+    try {
+      await request.text();
+    } catch {
+      // An interrupted upload rejects the read.
+    } finally {
+      probe.uploading = false;
+    }
+  }
 
   if (mode === "hang") {
     // Give up eventually so a missing abort fails the test instead of leaving

@@ -25,6 +25,8 @@ type Probe = {
   cancelled: boolean;
   overridden: boolean;
   timedOut: boolean;
+  uploading: boolean;
+  abortedWhileUploading: boolean;
 } | null;
 
 async function readProbe(baseUrl: string, probePath: string, id: string): Promise<Probe> {
@@ -109,6 +111,8 @@ type ProbeTarget = {
   body: "streamed" | "buffered";
   /** Whether the fixture middleware can override a request header for this path. */
   override: boolean;
+  /** Whether the handler receives the request body. */
+  upload: boolean;
 };
 
 type ServerTarget = {
@@ -152,18 +156,21 @@ const APP_ROUTE_PROBE: ProbeTarget = {
   path: "/api/request-signal",
   body: "streamed",
   override: true,
+  upload: true,
 };
 const PAGES_EDGE_API_PROBE: ProbeTarget = {
   name: "edge API route",
   path: "/api/edge-request-signal",
   body: "streamed",
   override: true,
+  upload: true,
 };
 const PAGES_MIDDLEWARE_PROBE: ProbeTarget = {
   name: "middleware",
   path: "/middleware-request-signal",
   body: "streamed",
   override: false,
+  upload: true,
 };
 
 const targets: ServerTarget[] = [
@@ -192,7 +199,8 @@ const targets: ServerTarget[] = [
   {
     name: "Pages Router dev",
     reason: "ResponseAborted",
-    probes: [PAGES_EDGE_API_PROBE, PAGES_MIDDLEWARE_PROBE],
+    // The Pages dev middleware request carries no body.
+    probes: [PAGES_EDGE_API_PROBE, { ...PAGES_MIDDLEWARE_PROBE, upload: false }],
     externalRewritePath: "/external-middleware-rewrite-body",
     start: () => startDevServer(PAGES_FIXTURE_DIR),
   },
@@ -234,7 +242,7 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
     }
   }, 30_000);
 
-  describe.each(probes)("$name", ({ path: probePath, body, override }) => {
+  describe.each(probes)("$name", ({ path: probePath, body, override, upload }) => {
     it("aborts when the client disconnects before the response is sent", async () => {
       const id = randomUUID();
       await disconnectMidRequest(baseUrl, probePath, id, { query: "mode=hang", waitFor: "probe" });
@@ -266,6 +274,27 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
         await expect
           .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
           .toMatchObject({ ...aborted, timedOut: false, overridden: true });
+      },
+      30_000,
+    );
+
+    it.runIf(upload)(
+      "aborts while the request body is still uploading when the client disconnects",
+      async () => {
+        const id = randomUUID();
+        const client = http.request(`${baseUrl}${probePath}?mode=hang&id=${id}`, {
+          method: "POST",
+          headers: { "content-length": "100000", "content-type": "text/plain" },
+        });
+        client.on("error", () => {});
+        client.write("partial");
+        await expect
+          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 20_000 })
+          .toMatchObject({ aborted: false, uploading: true });
+        client.destroy();
+        await expect
+          .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
+          .toMatchObject({ ...aborted, abortedWhileUploading: true });
       },
       30_000,
     );
