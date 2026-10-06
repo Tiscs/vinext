@@ -115,13 +115,36 @@ type ProbeTarget = {
   upload: boolean;
 };
 
+type ExternalRewrite = {
+  name: string;
+  path: string;
+  /** Extra request headers that select the middleware branch. */
+  headers?: Record<string, string>;
+};
+
+const APP_EXTERNAL_REWRITES: ExternalRewrite[] = [
+  { name: "an external rewrite", path: "/middleware-external-rewrite" },
+  {
+    name: "an external rewrite with middleware request headers",
+    path: "/middleware-external-rewrite",
+    headers: { "x-middleware-test-request-override": "1" },
+  },
+];
+const PAGES_EXTERNAL_REWRITES: ExternalRewrite[] = [
+  { name: "an external rewrite", path: "/external-middleware-rewrite-body" },
+  {
+    name: "an external rewrite with middleware request headers",
+    path: "/external-middleware-rewrite-with-headers",
+  },
+];
+
 type ServerTarget = {
   name: string;
   /** Next.js aborts with `ResponseAborted`; undefined skips the reason check. */
   reason?: string;
   probes: ProbeTarget[];
-  /** Middleware path that proxies to `x-middleware-test-rewrite-target`. */
-  externalRewritePath: string;
+  /** Middleware external rewrites that proxy to `x-middleware-test-rewrite-target`. */
+  externalRewrites: ExternalRewrite[];
   start: () => Promise<{ baseUrl: string; close: () => Promise<void> }>;
 };
 
@@ -178,14 +201,14 @@ const targets: ServerTarget[] = [
     name: "App Router production",
     reason: "ResponseAborted",
     probes: [APP_ROUTE_PROBE],
-    externalRewritePath: "/middleware-external-rewrite",
+    externalRewrites: APP_EXTERNAL_REWRITES,
     start: async () => startBuiltProdServer(await buildAppFixture(APP_FIXTURE_DIR)),
   },
   {
     // Served by @vitejs/plugin-rsc through srvx, which owns this signal.
     name: "App Router dev",
     probes: [APP_ROUTE_PROBE],
-    externalRewritePath: "/middleware-external-rewrite",
+    externalRewrites: APP_EXTERNAL_REWRITES,
     start: () => startDevServer(APP_FIXTURE_DIR),
   },
   {
@@ -193,7 +216,7 @@ const targets: ServerTarget[] = [
     reason: "ResponseAborted",
     // The Pages production server buffers edge API bodies before sending them.
     probes: [{ ...PAGES_EDGE_API_PROBE, body: "buffered" }, PAGES_MIDDLEWARE_PROBE],
-    externalRewritePath: "/external-middleware-rewrite-body",
+    externalRewrites: PAGES_EXTERNAL_REWRITES,
     start: async () => startBuiltProdServer(await buildPagesFixture(PAGES_FIXTURE_DIR)),
   },
   {
@@ -201,12 +224,12 @@ const targets: ServerTarget[] = [
     reason: "ResponseAborted",
     // The Pages dev middleware request carries no body.
     probes: [PAGES_EDGE_API_PROBE, { ...PAGES_MIDDLEWARE_PROBE, upload: false }],
-    externalRewritePath: "/external-middleware-rewrite-body",
+    externalRewrites: PAGES_EXTERNAL_REWRITES,
     start: () => startDevServer(PAGES_FIXTURE_DIR),
   },
 ];
 
-describe.each(targets)("$name request.signal", ({ reason, probes, externalRewritePath, start }) => {
+describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrites, start }) => {
   let baseUrl: string;
   let close: (() => Promise<void>) | undefined;
 
@@ -225,22 +248,26 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
 
   const aborted = reason === undefined ? { aborted: true } : { aborted: true, reason };
 
-  it("stops an external rewrite upstream request when the client disconnects", async () => {
-    const upstream = await startHangingUpstream();
-    try {
-      const client = http.request(`${baseUrl}${externalRewritePath}`, {
-        headers: { "x-middleware-test-rewrite-target": upstream.url },
-      });
-      client.on("error", () => {});
-      client.end();
-      await expect.poll(() => upstream.state.received, { timeout: 20_000 }).toBe(true);
-      client.destroy();
-      // The proxy's own timeout is 30 seconds; the disconnect must win.
-      await expect.poll(() => upstream.state.closed, { timeout: 3_000 }).toBe(true);
-    } finally {
-      await upstream.close();
-    }
-  }, 30_000);
+  it.each(externalRewrites)(
+    "stops $name upstream request when the client disconnects",
+    async ({ path: rewritePath, headers }) => {
+      const upstream = await startHangingUpstream();
+      try {
+        const client = http.request(`${baseUrl}${rewritePath}`, {
+          headers: { ...headers, "x-middleware-test-rewrite-target": upstream.url },
+        });
+        client.on("error", () => {});
+        client.end();
+        await expect.poll(() => upstream.state.received, { timeout: 20_000 }).toBe(true);
+        client.destroy();
+        // The proxy's own timeout is 30 seconds; the disconnect must win.
+        await expect.poll(() => upstream.state.closed, { timeout: 3_000 }).toBe(true);
+      } finally {
+        await upstream.close();
+      }
+    },
+    30_000,
+  );
 
   describe.each(probes)("$name", ({ path: probePath, body, override, upload }) => {
     it("aborts when the client disconnects before the response is sent", async () => {
