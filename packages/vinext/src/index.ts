@@ -8551,6 +8551,13 @@ async function writeWebResponseToNodeRes(
   res: import("node:http").ServerResponse,
   response: Response,
 ): Promise<void> {
+  if (res.destroyed) {
+    // The client left while the response was produced; nobody will read it.
+    response.body?.cancel().catch(() => {
+      /* ignore cancellation failures on discarded bodies */
+    });
+    return;
+  }
   const nodeHeaders: Record<string, string | string[]> = {};
   response.headers.forEach((value, key) => {
     if (key === "set-cookie") return;

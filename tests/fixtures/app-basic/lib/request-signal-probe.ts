@@ -10,6 +10,8 @@ type RequestSignalProbe = {
   cancelled: boolean;
   /** Whether a middleware request-header override reached the handler. */
   overridden: boolean;
+  /** Whether `?mode=hang` gave up waiting instead of observing the abort. */
+  timedOut: boolean;
 };
 
 export const REQUEST_SIGNAL_OVERRIDE_HEADER = "x-request-signal-override";
@@ -30,9 +32,25 @@ function reasonName(reason: unknown): string | null {
   return typeof name === "string" ? name : null;
 }
 
+/** One event, then stays open until the server cancels the body. */
+function streamedResponse(probe: RequestSignalProbe): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: start\n\n"));
+      },
+      cancel() {
+        probe.cancelled = true;
+      },
+    }),
+    { headers: { "cache-control": "no-store", "content-type": "text/event-stream" } },
+  );
+}
+
 /**
  * `?mode=status&id=<id>` reports the probe recorded for `<id>`.
- * `?mode=hang` holds the response until the request signal aborts.
+ * `?mode=hang` holds the response until the request signal aborts, then
+ *   returns a streamed body the server should cancel.
  * `?mode=stream` streams one event and then stays open.
  * Any other mode responds immediately.
  * `?override` asks the fixture middleware to override a request header first.
@@ -57,6 +75,7 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
     reason: null,
     cancelled: false,
     overridden: request.headers.get(REQUEST_SIGNAL_OVERRIDE_HEADER) === "1",
+    timedOut: false,
   };
   probes().set(id, probe);
   const aborted = new Promise<void>((resolve) => {
@@ -80,22 +99,15 @@ export async function handleRequestSignalProbe(request: Request): Promise<Respon
       }),
     ]);
     clearTimeout(timer);
-    return new Response("done", { headers: { "cache-control": "no-store" } });
+    if (!signal.aborted) {
+      probe.timedOut = true;
+      return new Response("done", { headers: { "cache-control": "no-store" } });
+    }
+    // Produced after the disconnect, so the server must discard (cancel) it.
+    return streamedResponse(probe);
   }
 
-  if (mode === "stream") {
-    return new Response(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("data: start\n\n"));
-        },
-        cancel() {
-          probe.cancelled = true;
-        },
-      }),
-      { headers: { "cache-control": "no-store", "content-type": "text/event-stream" } },
-    );
-  }
+  if (mode === "stream") return streamedResponse(probe);
 
   return new Response("ok", { headers: { "cache-control": "no-store" } });
 }

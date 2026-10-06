@@ -24,6 +24,7 @@ type Probe = {
   reason: string | null;
   cancelled: boolean;
   overridden: boolean;
+  timedOut: boolean;
 } | null;
 
 async function readProbe(baseUrl: string, probePath: string, id: string): Promise<Probe> {
@@ -203,6 +204,11 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
 
   beforeAll(async () => {
     ({ baseUrl, close } = await start());
+    // Compile each probe route up front: dev servers can hold requests to a
+    // cold route, which would delay the readiness polls below.
+    for (const probe of probes) {
+      expect(await readProbe(baseUrl, probe.path, "warmup")).toBeNull();
+    }
   }, 120_000);
 
   afterAll(async () => {
@@ -232,9 +238,10 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
     it("aborts when the client disconnects before the response is sent", async () => {
       const id = randomUUID();
       await disconnectMidRequest(baseUrl, probePath, id, { query: "mode=hang", waitFor: "probe" });
+      // The handler then returns a streamed body, which must be discarded.
       await expect
         .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-        .toMatchObject(aborted);
+        .toMatchObject({ ...aborted, timedOut: false, cancelled: true });
     }, 30_000);
 
     it("aborts and cancels the body when the client disconnects during a streamed response", async () => {
@@ -258,7 +265,7 @@ describe.each(targets)("$name request.signal", ({ reason, probes, externalRewrit
         });
         await expect
           .poll(() => readProbe(baseUrl, probePath, id), { timeout: 3_000 })
-          .toMatchObject({ ...aborted, overridden: true });
+          .toMatchObject({ ...aborted, timedOut: false, overridden: true });
       },
       30_000,
     );
