@@ -14,7 +14,9 @@ import {
 import {
   APP_FIXTURE_DIR,
   createIsolatedFixture,
+  EXTERNAL_REWRITE_HEADER_CASES,
   expectRepeatedSlashRedirects,
+  requestExternalRewriteHeaders,
   testCacheDir,
 } from "./helpers.js";
 
@@ -474,6 +476,84 @@ describe("App Router Production server (startProdServer)", () => {
       expect(sessionCookies[1]).toMatch(session);
     },
   );
+
+  // Next.js's send-response keeps a route handler's WWW-Authenticate and
+  // Proxy-Authenticate values after middleware's; singular headers stay
+  // middleware-owned.
+  it("keeps a route handler's authentication challenges after middleware's", async () => {
+    const res = await fetch(`${baseUrl}/api/auth-challenge`);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe(
+      'Basic realm="middleware", Bearer realm="handler"',
+    );
+    expect(res.headers.get("proxy-authenticate")).toBe(
+      'Basic realm="middleware", Bearer realm="handler"',
+    );
+    expect(res.headers.get("x-auth-source")).toBe("middleware");
+  });
+
+  it("never joins a hybrid Pages API route's challenge to middleware's", async () => {
+    const res = await fetch(`${baseUrl}/api/pages-auth-challenge`);
+    expect(res.status).toBe(401);
+    // Next.js lets the handler's setHeader() replace middleware's challenge.
+    expect(['Basic realm="middleware"', 'Bearer realm="handler"']).toContain(
+      res.headers.get("www-authenticate"),
+    );
+  });
+
+  // Next.js proxies a next.config external rewrite without the headers it
+  // staged, and sets the upstream's headers over a middleware rewrite's.
+  it.each(EXTERNAL_REWRITE_HEADER_CASES)(
+    "applies config and middleware headers to external rewrites like Next.js for $path",
+    async ({ path: requestPath, ...expected }) => {
+      expect(await requestExternalRewriteHeaders(baseUrl, requestPath)).toEqual({
+        status: 200,
+        cacheControl: "public, max-age=60",
+        upstreamHeader: "1",
+        ...expected,
+      });
+    },
+  );
+
+  // Next.js stages next.config headers before middleware: a config Set-Cookie
+  // precedes the response's own cookies, and middleware's cookie replaces it.
+  it.each([
+    {
+      path: "/api/config-cookie",
+      cookies: ["config-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    {
+      path: "/api/config-cookie?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    {
+      path: "/api/config-cookie?middleware-cookie",
+      cookies: ["middleware-cookie=1; Path=/", "handler-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-redirect", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    {
+      path: "/config-cookie-redirect?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    {
+      path: "/config-cookie-response?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-response", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-response?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+  ])("orders next.config Set-Cookie like Next.js for $path", async ({ path, cookies }) => {
+    // Read raw headers: fetch() hides an empty Set-Cookie line.
+    const rawCookies = await new Promise<string[]>((resolve, reject) => {
+      http
+        .get(`${baseUrl}${path}`, (res) => {
+          res.resume();
+          resolve(res.headers["set-cookie"] ?? []);
+        })
+        .on("error", reject);
+    });
+    expect(rawCookies).toEqual(cookies);
+  });
 
   it("never lets an absolute-form request target choose the request origin", async () => {
     // `/middleware-redirect` answers `NextResponse.redirect(new URL("/about",
@@ -1104,12 +1184,18 @@ describe("App Router Production server (startProdServer)", () => {
     // of its own, its script preload links must not follow the text, or React
     // leaves a `<!-- -->` separator in their place, which Next.js doesn't emit.
     expect(html).toMatch(/<div>Index<p id="dynamic-use-id">/);
-    // The component's script preload is still rendered (and hoisted).
+    // The component's script preload is still rendered (and hoisted). Client
+    // file names are hash-only, so find the chunk through the build manifest.
+    const clientManifest = JSON.parse(
+      fs.readFileSync(path.join(outDir, "client", ".vite", "manifest.json"), "utf8"),
+    ) as Record<string, { file: string }>;
+    const useIdKey = Object.keys(clientManifest).find((key) => key.endsWith("/use-id-field.tsx"));
+    expect(useIdKey).toBeDefined();
     const dynamicScriptPreloads = (html.match(/<link\b[^>]*>/g) ?? []).filter(
       (tag) =>
         /\brel="modulepreload"/.test(tag) &&
         /\bfetchpriority="low"/i.test(tag) &&
-        /use-id-field[^"]*\.js"/.test(tag),
+        tag.includes(`href="/${clientManifest[useIdKey!].file}"`),
     );
     expect(dynamicScriptPreloads).toHaveLength(1);
   });
@@ -1544,6 +1630,19 @@ describe("App Router Production server (startProdServer)", () => {
     expect(res.headers.get("content-type")).toContain("image/png");
     expect(res.headers.get("x-mw-ran")).toBe("true");
     expect((await res.blob()).size).toBeGreaterThan(0);
+  });
+
+  it("supports res.appendHeader in Pages API routes after middleware cookies in hybrid production", async () => {
+    const res = await fetch(`${baseUrl}/api/pages-append-header`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.getSetCookie()).toEqual(["mw=1; Path=/", "h=1; Path=/"]);
+    expect(res.headers.get("x-multi")).toBe("a, b");
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      multi: ["a", "b"],
+      headersMulti: ["a", "b"],
+    });
   });
 
   it("serves dynamic routes", async () => {

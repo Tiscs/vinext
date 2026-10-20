@@ -188,6 +188,59 @@ test.describe("Config Custom Headers (OpenNext compat)", () => {
     expect(res.headers()["x-page-header"]).toBe("about-page");
   });
 
+  test("header sources with path-to-regexp modifiers match like Next.js", async ({ request }) => {
+    const headersFor = async (path: string, status = 200) => {
+      const res = await request.get(`${BASE}${path}`);
+      expect(res.status()).toBe(status);
+      const headers = res.headers();
+      return {
+        star: headers["x-dashboard-path-star"],
+        plus: headers["x-dashboard-path-plus"],
+        optional: headers["x-dashboard-optional"],
+        lookahead: headers["x-dashboard-lookahead"],
+      };
+    };
+
+    // `:path*` and `:section?` also cover the base path.
+    expect(await headersFor("/dashboard")).toEqual({
+      star: "1",
+      plus: undefined,
+      optional: "1",
+      lookahead: undefined,
+    });
+    expect(await headersFor("/dashboard/settings")).toEqual({
+      star: "1",
+      plus: "1",
+      optional: "1",
+      lookahead: "1",
+    });
+    // `(?!missing)` excludes this notFound() page; config headers still apply
+    // to the 404 response.
+    expect(await headersFor("/dashboard/missing", 404)).toEqual({
+      star: "1",
+      plus: "1",
+      optional: "1",
+      lookahead: undefined,
+    });
+  });
+
+  test("matched params are substituted into header keys and values", async ({ request }) => {
+    const prerendered = await request.get(`${BASE}/blog/hello-world`);
+    expect(prerendered.status()).toBe(200);
+    expect(prerendered.headers()["x-blog-slug"]).toBe("slug=hello-world");
+    expect(prerendered.headers()["x-blog-hello-world"]).toBe("1");
+
+    // Like Next.js, captures are the raw percent-encoded path text.
+    const encoded = await request.get(`${BASE}/blog/a%20b`);
+    expect(encoded.status()).toBe(200);
+    expect(encoded.headers()["x-blog-slug"]).toBe("slug=a%20b");
+
+    // `*` params join with their template prefix; `has` named groups are params too.
+    const dashboard = await request.get(`${BASE}/dashboard/settings?ref=docs`);
+    expect(dashboard.status()).toBe(200);
+    expect(dashboard.headers()["x-dashboard-params"]).toBe("settings via docs");
+  });
+
   test("custom header applied to API routes", async ({ request }) => {
     const res = await request.get(`${BASE}/api/hello`);
     expect(res.status()).toBe(200);

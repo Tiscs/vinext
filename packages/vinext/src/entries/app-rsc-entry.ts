@@ -240,6 +240,8 @@ type AppRouterConfig = {
   draftModeSecret?: string;
   /** Server-only token used to authorize build-time prerender endpoints. */
   prerenderSecret?: string;
+  /** next.config `skipProxyUrlNormalize`. */
+  skipProxyUrlNormalize?: boolean;
   /** next.config `skipTrailingSlashRedirect`. */
   skipTrailingSlashRedirect?: boolean;
   /** Dev-only key authenticating the hybrid Pages handler's forwarded middleware context. */
@@ -315,30 +317,42 @@ function buildAppDecodedPathnamePatterns(
     .map((route) => route.pattern);
 }
 
-function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
+type ForcesDynamic = (filePath: string | null | undefined) => boolean;
+
+function createForcesDynamicReader(): ForcesDynamic {
   const readSource = createSegmentSourceReader();
-  const forcesDynamic = (filePath: string | null | undefined): boolean => {
+  return (filePath) => {
     const source = readSource(filePath);
     return source !== null && extractExportConstString(source, "dynamic") === "force-dynamic";
   };
+}
+
+/** Whether a direct request to the route renders a `dynamic = "force-dynamic"` tree. */
+function directRequestForcesDynamic(route: AppRoute, forcesDynamic: ForcesDynamic): boolean {
+  return route.routePath
+    ? forcesDynamic(route.routePath)
+    : appPageSegmentConfigPaths(route).some(forcesDynamic);
+}
+
+function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
+  const forcesDynamic = createForcesDynamicReader();
 
   return routes.map((route) => ({
     canUseCanonicalLoadingShell: appRouteHasMainTreeLoadingBoundary(route),
-    forceDynamic: route.routePath
-      ? forcesDynamic(route.routePath)
-      : [
-          ...appPageSegmentConfigPaths(route),
-          ...route.parallelSlots.flatMap((slot) =>
-            slot.interceptingRoutes.flatMap((intercept) => [
-              ...intercept.layoutPaths,
-              intercept.pagePath,
-            ]),
-          ),
-          ...route.siblingIntercepts.flatMap((intercept) => [
+    forceDynamic:
+      directRequestForcesDynamic(route, forcesDynamic) ||
+      [
+        ...route.parallelSlots.flatMap((slot) =>
+          slot.interceptingRoutes.flatMap((intercept) => [
             ...intercept.layoutPaths,
             intercept.pagePath,
           ]),
-        ].some(forcesDynamic),
+        ),
+        ...route.siblingIntercepts.flatMap((intercept) => [
+          ...intercept.layoutPaths,
+          intercept.pagePath,
+        ]),
+      ].some(forcesDynamic),
     ids: route.ids ?? null,
     pattern: route.pattern,
     patternParts: route.patternParts,
@@ -395,6 +409,34 @@ function buildAppRequestRouteMetadata(routes: AppRoute[]): unknown[] {
       params: intercept.params,
     })),
   }));
+}
+
+/**
+ * Register the build-time route facts `revalidatePath()` uses to skip CDN
+ * purges for force-dynamic routes. A Pages Router can serve the same paths
+ * without those facts, so mixed apps always purge.
+ */
+function generateCdnPurgeRoutesRegistration(
+  routes: AppRoute[],
+  metadataRoutes: MetadataFileRoute[] | undefined,
+  config: AppRouterConfig | undefined,
+): string {
+  if (config?.hasPagesDir) return "";
+  const forcesDynamic = createForcesDynamicReader();
+  const purgeRoutes = {
+    metadataRoutes: (metadataRoutes ?? []).map((route) => ({
+      patternParts: route.patternParts ?? null,
+      routeSegments: route.routeSegments ?? [],
+      servedUrl: route.servedUrl,
+    })),
+    routes: routes.map((route) => ({
+      forceDynamic: directRequestForcesDynamic(route, forcesDynamic),
+      patternParts: route.patternParts,
+      routeSegments: route.routeSegments,
+    })),
+  };
+  return `import { registerCdnPurgeRoutes as __registerCdnPurgeRoutes } from "vinext/shims/cdn-purge-routes";
+__registerCdnPurgeRoutes(${JSON.stringify(purgeRoutes)});`;
 }
 
 /** Generate the module-free App request stage used by multi-stage Worker outputs. */
@@ -496,6 +538,7 @@ export const __clientBuildFiles = __pagesClientAssets.clientBuildFiles ?? [];
 const __routes = ${JSON.stringify(requestRoutes)};
 const __routeMatcher = __createAppRscRouteMatcher(__routes, ${JSON.stringify(buildAppDecodedPathnamePatterns(routes, config))});
 const __metadataRouteMatchers = ${JSON.stringify(metadataRouteMatchers)};
+${generateCdnPurgeRoutesRegistration(routes, metadataRoutes, config)}
 
 function matchRoute(pathname) { return __routeMatcher.matchRoute(pathname); }
 function matchRequestRoute(pathname) { return __routeMatcher.matchRequestRoute(pathname); }
@@ -626,6 +669,7 @@ const __requestHandler = createAppRscRequestHandler({
   }
   rootParamNamesByPattern: {},
   setNavigationContext,
+  skipProxyUrlNormalize: ${JSON.stringify(config?.skipProxyUrlNormalize ?? false)},
   skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: {},
   trailingSlash: __trailingSlash,
@@ -782,19 +826,34 @@ import {
   renderToReadableStream as _renderToReadableStream,
   ${
     hasServerActions
-      ? `decodeAction,
-  decodeFormState,
-  decodeReply,
-  loadServerAction,
+      ? `loadServerAction,
   createTemporaryReferenceSet,`
       : ""
   }
 } from ${JSON.stringify(
     hasServerActions ? "@vitejs/plugin-rsc/rsc" : "@vitejs/plugin-rsc/react/rsc",
   )};
-import { createClientManifest as _createClientManifest } from "@vitejs/plugin-rsc/core/rsc";
+import {
+  createClientManifest as _createClientManifest,${
+    hasServerActions
+      ? `
+  createServerManifest as _createServerManifest,`
+      : ""
+  }
+} from "@vitejs/plugin-rsc/core/rsc";
 import { prerender as _prerender } from "@vitejs/plugin-rsc/vendor/react-server-dom/static.edge";
-import { createRscPrerenderer, createRscRenderer } from ${JSON.stringify(rscStreamHintsPath)};
+${
+  hasServerActions
+    ? `// plugin-rsc's decoders fix an unscoped server manifest; React's own take the
+// manifest, so actions can scope the server references they decode per route.
+import {
+  decodeAction as _decodeAction,
+  decodeFormState as _decodeFormState,
+  decodeReply as _decodeReply,
+} from "@vitejs/plugin-rsc/vendor/react-server-dom/server.edge";
+`
+    : ""
+}import { createRscPrerenderer, createRscRenderer } from ${JSON.stringify(rscStreamHintsPath)};
 
 const renderToReadableStream = createRscRenderer(_renderToReadableStream);
 const prerenderToReadableStream = createRscPrerenderer(async (model, options) =>
@@ -1241,6 +1300,8 @@ ${
     ? "let __fallbackRenderer;"
     : "const __fallbackRenderer = __createFallbackRenderer();"
 }
+
+${generateCdnPurgeRoutesRegistration(routes, metadataRoutes, config)}
 
 function matchRoute(url) {
   return __routeMatcher.matchRoute(url);
@@ -1707,8 +1768,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
         __clearRequestContext();
       },
       contentType,
-      decodeAction,
-      decodeFormState,
+      createServerManifest: _createServerManifest,
+      decodeAction: _decodeAction,
+      decodeFormState: _decodeFormState,
       getAndClearPendingCookies,
       getDraftModeCookieHeader,
       forwardAction(__progressiveActionId) {
@@ -1763,6 +1825,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
     searchParams,
   }) {
     const {
+      areServerActionsOwnedByRoute: __areServerActionsOwnedByRoute,
       createForwardedActionContext: __createForwardedActionContext,
       forwardServerActionIfNeeded: __forwardServerActionIfNeeded,
     } = await __loadAppActionForwarding();
@@ -1850,8 +1913,9 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       createRscOnErrorHandler(actionRequest, actionPathname, routePattern, overrides) {
         return createRscOnErrorHandler(actionRequest, actionPathname, routePattern, overrides);
       },
+      createServerManifest: _createServerManifest,
       createTemporaryReferenceSet,
-      decodeReply,
+      decodeReply: _decodeReply,
       dispatchRedirectRequest(redirectRequest) {
         return __appRscHandler(redirectRequest, undefined);
       },
@@ -1869,6 +1933,13 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
       },
       isRscRequest,
       loadServerAction,
+      validateActionReferences(__argumentActionIds) {
+        return __areServerActionsOwnedByRoute(
+          __VINEXT_ACTION_OWNERS(),
+          __argumentActionIds,
+          __actionMatch?.route.pattern ?? null,
+        );
+      },
       // Redirect targets are rendered as if the client had navigated to them,
       // so they must route on the raw pathname a real request would use.
       matchRoute(pathnameToMatch) {
@@ -2056,6 +2127,7 @@ ${responseStageOnly ? "const __responseStageOptions = {" : "const __appRscHandle
   }
   rootParamNamesByPattern: rootParamNamesMap,
   setNavigationContext,
+  skipProxyUrlNormalize: ${JSON.stringify(config?.skipProxyUrlNormalize ?? false)},
   skipTrailingSlashRedirect: ${JSON.stringify(config?.skipTrailingSlashRedirect ?? false)},
   staticParamsMap: generateStaticParamsMap,
   trailingSlash: __trailingSlash,

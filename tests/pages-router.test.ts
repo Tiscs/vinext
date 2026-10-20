@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vite-plus/test";
 import { createBuilder, createServer, build, type ViteDevServer } from "vite-plus";
-import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
+import { get as httpGet, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import path from "node:path";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -18,11 +18,14 @@ import {
 import {
   PAGES_FIXTURE_DIR,
   buildPagesFixture,
+  EXTERNAL_REWRITE_HEADER_CASES,
   expectRepeatedSlashRedirects,
+  requestExternalRewriteHeaders,
   startFixtureServer,
 } from "./helpers.js";
 import { registerFrameworkTracingIntegration } from "../packages/vinext/src/server/tracer.js";
 import type { ResolvedFrameworkSpanDescriptor } from "../packages/vinext/src/server/framework-tracer.js";
+import { SSR_MANIFEST_SHARED_CHUNKS_KEY } from "../packages/vinext/src/utils/manifest-paths.js";
 
 let captureFrameworkSpans = false;
 const capturedFrameworkSpans: ResolvedFrameworkSpanDescriptor[] = [];
@@ -42,6 +45,8 @@ const PAGES_APP_COMPONENT = `export default function App({ Component, pageProps 
 
 type ClientBuildManifestEntry = {
   file?: string;
+  name?: string;
+  isEntry?: boolean;
   css?: string[];
   assets?: string[];
 };
@@ -1842,6 +1847,70 @@ export default class CustomDocument extends Document {
       _api_session: "trusted",
       theme: "dark",
     });
+  });
+
+  // Next.js API routes get a real Node ServerResponse, so res.appendHeader()
+  // (Node 18.3+) works and its cookies follow middleware's.
+  it("supports res.appendHeader in API routes after middleware cookies", async () => {
+    const res = await fetch(`${baseUrl}/api/append-header`);
+    expect(res.status).toBe(200);
+    expect(res.headers.getSetCookie()).toEqual(["mw=1; Path=/", "h=1; Path=/"]);
+    expect(res.headers.get("x-multi")).toBe("a, b");
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      multi: ["a", "b"],
+      headersMulti: ["a", "b"],
+    });
+  });
+
+  it("rejects res.appendHeader after the API route wrote its headers", async () => {
+    const res = await fetch(`${baseUrl}/api/append-header-after-write`);
+    expect(res.status).toBe(200);
+    expect(res.headers.has("x-late")).toBe(false);
+    expect(await res.text()).toBe("start:ERR_HTTP_HEADERS_SENT");
+  });
+
+  // Next.js proxies a next.config external rewrite without the headers it
+  // staged, and sets the upstream's headers over a middleware rewrite's.
+  it.each(EXTERNAL_REWRITE_HEADER_CASES)(
+    "applies config and middleware headers to external rewrites like Next.js for $path",
+    async ({ path: requestPath, ...expected }) => {
+      expect(await requestExternalRewriteHeaders(baseUrl, requestPath)).toEqual({
+        status: 200,
+        cacheControl: "public, max-age=60",
+        upstreamHeader: "1",
+        ...expected,
+      });
+    },
+  );
+
+  // Next.js stages next.config headers before middleware, and middleware's
+  // own Set-Cookie replaces a config one.
+  it.each([
+    { path: "/config-cookie-page", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-page?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    { path: "/config-cookie-page?empty-middleware-cookie", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    {
+      path: "/config-cookie-redirect?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    {
+      path: "/config-cookie-response?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-response", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-response?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+  ])("orders next.config Set-Cookie like Next.js for $path", async ({ path, cookies }) => {
+    // Read raw headers: fetch() hides an empty Set-Cookie line.
+    const rawCookies = await new Promise<string[]>((resolve, reject) => {
+      httpGet(`${baseUrl}${path}`, (res) => {
+        res.resume();
+        resolve(res.headers["set-cookie"] ?? []);
+      }).on("error", reject);
+    });
+    expect(rawCookies).toEqual(cookies);
   });
 
   it("handles dynamic API routes with query params", async () => {
@@ -5099,43 +5168,47 @@ describe("Plugin config", () => {
       const configPlugin = plugins.find((p) => p.name === "vinext:config");
       expect(configPlugin).toBeDefined();
 
+      // The compatibility ID and the per-build identity are server-only; the
+      // browser bundle gets "".
+      const readServerDefine = (vinextPlugins: any[], name: string) =>
+        vinextPlugins
+          .find((p) => p.name === "vinext:compiler-define-server")
+          .configEnvironment("rsc", {}, { command: "build" }).define[`process.env.${name}`];
+      const readServerRscBuildIdentity = (vinextPlugins: any[]) =>
+        readServerDefine(vinextPlugins, "__VINEXT_RSC_BUILD_IDENTITY");
       const result = await configPlugin.config(
         { root: tmpDir, plugins: [] },
         { command: "build", mode: "production" },
       );
+      const rscBuildIdentity = readServerRscBuildIdentity(plugins);
+      const rscCompatibilityId = readServerDefine(plugins, "__VINEXT_RSC_COMPATIBILITY_ID");
       const repeatedResult = await configPlugin.config(
         { root: tmpDir, plugins: [] },
         { command: "build", mode: "production" },
       );
 
-      expect(result.define["process.env.__VINEXT_BUILD_ID"]).toBe(JSON.stringify(buildId));
-      expect(result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).not.toBe(
-        JSON.stringify(buildId),
-      );
-      expect(JSON.parse(result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"])).toMatch(
-        /^[0-9a-f-]{36}$/,
-      );
-      expect(repeatedResult.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe(
-        result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"],
-      );
-      const rscBuildIdentity = result.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"];
+      expect(readServerDefine(plugins, "__VINEXT_BUILD_ID")).toBe(JSON.stringify(buildId));
+      expect(result.define["process.env.__VINEXT_BUILD_ID"]).toBe("undefined");
+      expect(rscCompatibilityId).not.toBe(JSON.stringify(buildId));
+      expect(JSON.parse(rscCompatibilityId)).toMatch(/^[0-9a-f-]{36}$/);
+      expect(readServerDefine(plugins, "__VINEXT_RSC_COMPATIBILITY_ID")).toBe(rscCompatibilityId);
+      expect(result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe('""');
+      expect(repeatedResult.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe('""');
+      expect(result.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).toBe('""');
       expect(JSON.parse(rscBuildIdentity)).toMatch(/^[0-9a-f]{32}$/);
-      expect(repeatedResult.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).toBe(
-        rscBuildIdentity,
-      );
+      expect(repeatedResult.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).toBe('""');
+      expect(readServerRscBuildIdentity(plugins)).toBe(rscBuildIdentity);
 
       const nextBuildPlugins = vinext({
         nextConfig: { generateBuildId: () => buildId },
       }) as any[];
       const nextBuildConfigPlugin = nextBuildPlugins.find((p) => p.name === "vinext:config");
-      const nextBuildResult = await nextBuildConfigPlugin.config(
+      await nextBuildConfigPlugin.config(
         { root: tmpDir, plugins: [] },
         { command: "build", mode: "production" },
       );
-      expect(nextBuildResult.define["process.env.__VINEXT_BUILD_ID"]).toBe(JSON.stringify(buildId));
-      expect(nextBuildResult.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).not.toBe(
-        rscBuildIdentity,
-      );
+      expect(readServerDefine(nextBuildPlugins, "__VINEXT_BUILD_ID")).toBe(JSON.stringify(buildId));
+      expect(readServerRscBuildIdentity(nextBuildPlugins)).not.toBe(rscBuildIdentity);
     } finally {
       if (previousSharedRscBuildIdentity === undefined) {
         delete process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY;
@@ -5170,9 +5243,14 @@ describe("Plugin config", () => {
         { command: "build", mode: "production" },
       );
 
-      expect(result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe(
-        JSON.stringify("public-deployment-id"),
-      );
+      expect(
+        plugins
+          .find((p) => p.name === "vinext:compiler-define-server")
+          .configEnvironment("rsc", {}, { command: "build" }).define[
+          "process.env.__VINEXT_RSC_COMPATIBILITY_ID"
+        ],
+      ).toBe(JSON.stringify("public-deployment-id"));
+      expect(result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe('""');
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true });
     }
@@ -5878,13 +5956,22 @@ export const config = { matcher: ["/protected"] };
 
     // Client bundle should be code-split: framework (React/ReactDOM) in its
     // own chunk, vinext runtime in another, and the entry bootstrap should be
-    // small (not a monolithic bundle containing all vendor code).
-    const frameworkChunk = jsFiles.find((f: string) => f.startsWith("framework-"));
-    const vinextChunk = jsFiles.find((f: string) => f.startsWith("vinext-"));
-    const entryChunk = jsFiles.find((f: string) => f.includes("vinext-client-entry"));
+    // small (not a monolithic bundle containing all vendor code). Chunk names
+    // live in the build manifest; emitted file names are hash-only.
+    const chunkFileByName = (name: string) => {
+      const file = Object.values(buildManifest).find((entry) => entry.name === name)?.file;
+      return file ? path.basename(file) : undefined;
+    };
+    const frameworkChunk = chunkFileByName("framework");
+    const vinextChunk = chunkFileByName("vinext");
+    const entryChunk = Object.values(buildManifest).find((entry) => entry.isEntry)?.file;
     expect(frameworkChunk).toBeDefined();
     expect(vinextChunk).toBeDefined();
     expect(entryChunk).toBeDefined();
+    for (const file of [frameworkChunk, vinextChunk, entryChunk]) {
+      expect(jsFiles).toContain(path.basename(file!));
+      expect(path.basename(file!)).toMatch(/^[\w-]{8}\.js$/);
+    }
 
     // The entry chunk should stay small: it contains the hydration bootstrap
     // and this fixture's generated route table, but not the React framework.
@@ -5892,7 +5979,7 @@ export const config = { matcher: ["/protected"] };
     // parity routes, so allow their generated route-table entries while
     // retaining a tight guard against framework code entering the bootstrap.
     if (entryChunk) {
-      const entrySize = fs.statSync(path.join(assetsDir, entryChunk)).size;
+      const entrySize = fs.statSync(path.join(assetsDir, path.basename(entryChunk))).size;
       expect(entrySize).toBeLessThan(36 * 1024); // < 36 KB, including storage-policy, encoded-path, config query-param, res.revalidate and getStaticPaths request-time fixture routes
     }
 
@@ -6950,6 +7037,16 @@ export default function CounterPage() {
       const indexHtml = await indexRes.text();
       expect(indexHtml).toContain("Hello, vinext!");
       expect(indexHtml).toContain("__NEXT_DATA__");
+      // The two-call build registers no client metadata, so hydration scripts
+      // must come from the on-disk SSR manifest regardless of file names.
+      const clientScriptSrcs = [
+        ...indexHtml.matchAll(/<script type="module"[^>]*\bsrc="([^"]+)"/g),
+      ].map((match) => match[1]);
+      const sharedChunks: string[] = manifest[SSR_MANIFEST_SHARED_CHUNKS_KEY] ?? [];
+      expect(sharedChunks.length).toBeGreaterThan(0);
+      for (const file of sharedChunks) {
+        expect(clientScriptSrcs).toContain("/" + file);
+      }
       // Ported from Next.js: test/e2e/next-head/index.test.ts
       // https://github.com/vercel/next.js/blob/canary/test/e2e/next-head/index.test.ts
       const indexHeadContents = indexHtml.match(/<head[^>]*>([\s\S]*?)<\/head>/i)?.[1] ?? "";
@@ -7481,6 +7578,71 @@ describe("Production server middleware (Pages Router)", () => {
     // it is never relativized to a protocol-relative `//`.
     expect(res.headers.get("location")).toBe("/");
   });
+
+  it("supports res.appendHeader in API routes after middleware cookies in production", async () => {
+    const res = await fetch(`${prodUrl}/api/append-header`);
+    expect(res.status).toBe(200);
+    expect(res.headers.getSetCookie()).toEqual(["mw=1; Path=/", "h=1; Path=/"]);
+    expect(res.headers.get("x-multi")).toBe("a, b");
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      multi: ["a", "b"],
+      headersMulti: ["a", "b"],
+    });
+  });
+
+  it("rejects res.appendHeader after the API route wrote its headers in production", async () => {
+    const res = await fetch(`${prodUrl}/api/append-header-after-write`);
+    expect(res.status).toBe(200);
+    expect(res.headers.has("x-late")).toBe(false);
+    expect(await res.text()).toBe("start:ERR_HTTP_HEADERS_SENT");
+  });
+
+  // Next.js proxies a next.config external rewrite without the headers it
+  // staged, and sets the upstream's headers over a middleware rewrite's.
+  it.each(EXTERNAL_REWRITE_HEADER_CASES)(
+    "applies config and middleware headers to external rewrites like Next.js for $path in production",
+    async ({ path: requestPath, ...expected }) => {
+      expect(await requestExternalRewriteHeaders(prodUrl, requestPath)).toEqual({
+        status: 200,
+        cacheControl: "public, max-age=60",
+        upstreamHeader: "1",
+        ...expected,
+      });
+    },
+  );
+
+  // Next.js stages next.config headers before middleware, and middleware's
+  // own Set-Cookie replaces a config one.
+  it.each([
+    { path: "/config-cookie-page", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-page?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    { path: "/config-cookie-page?empty-middleware-cookie", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-redirect?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+    {
+      path: "/config-cookie-redirect?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    {
+      path: "/config-cookie-response?empty-middleware-cookie",
+      cookies: ["config-cookie=1; Path=/"],
+    },
+    { path: "/config-cookie-response", cookies: ["config-cookie=1; Path=/"] },
+    { path: "/config-cookie-response?middleware-cookie", cookies: ["middleware-cookie=1; Path=/"] },
+  ])(
+    "orders next.config Set-Cookie like Next.js for $path in production",
+    async ({ path, cookies }) => {
+      // Read raw headers: fetch() hides an empty Set-Cookie line.
+      const rawCookies = await new Promise<string[]>((resolve, reject) => {
+        httpGet(`${prodUrl}${path}`, (res) => {
+          res.resume();
+          resolve(res.headers["set-cookie"] ?? []);
+        }).on("error", reject);
+      });
+      expect(rawCookies).toEqual(cookies);
+    },
+  );
 
   it("redirects /old-page to /about via middleware", async () => {
     const res = await fetch(`${prodUrl}/old-page`, { redirect: "manual" });
@@ -10481,9 +10643,15 @@ export default function Page() { return <p>manifest reuse</p>; }
           pathToFileURL(path.join(root, "dist/vinext-client-assets.js")).href
         );
         const scans = { manifest: 0, cssGraph: 0, lazyChunks: 0 };
-        const frameworkFile = Object.values(assets.ssrManifest as Record<string, string[]>)
-          .flat()
-          .find((file) => file.includes("/framework-"))!;
+        const clientBuildManifest = JSON.parse(
+          await fsp.readFile(path.join(root, "dist/client/.vite/manifest.json"), "utf-8"),
+        ) as Record<string, ClientBuildManifestEntry>;
+        const frameworkFile = Object.values(clientBuildManifest).find(
+          (chunk) => chunk.name === "framework",
+        )!.file!;
+        const vinextRuntimeFile = Object.values(clientBuildManifest).find(
+          (chunk) => chunk.name === "vinext",
+        )!.file!;
         // Model a large app without making the test compile thousands of pages.
         for (let i = 0; i < 3000; i++) {
           assets.ssrManifest[`components/unused-${i}.tsx`] = [frameworkFile];
@@ -10527,9 +10695,14 @@ export default function Page() { return <p>manifest reuse</p>; }
         expect(first).toContain("manifest reuse");
         expect(first).toContain('rel="stylesheet"');
         expect(first).toContain(frameworkFile);
+        // Hash-only names carry no chunk name; shared chunks still get tags
+        // through the registered build list, even for a caller's manifest copy.
+        expect(first).toContain(`src="/${vinextRuntimeFile}"`);
         expect(first).not.toContain("lazy-2999.js");
         const initialScans = { ...scans };
-        expect(initialScans.manifest).toBe(registered ? 0 : 2);
+        // A caller-supplied manifest is indexed once for page lookups; shared
+        // chunks come from the registered build list without a scan.
+        expect(initialScans.manifest).toBe(registered ? 0 : 1);
         expect(initialScans.cssGraph).toBe(0);
         expect(initialScans.lazyChunks).toBeGreaterThan(0);
         for (let i = 0; i < 3; i++) expect(await render()).toBe(first);

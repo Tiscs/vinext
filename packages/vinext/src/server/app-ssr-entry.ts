@@ -8,7 +8,7 @@ import { Fragment, createElement as createReactElement, use } from "react";
 import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
 import type { RenderToReadableStreamOptions } from "react-dom/server";
 import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server.edge";
-import clientReferences from "virtual:vite-rsc/client-references";
+import clientReferences, { routeClientReferences } from "virtual:vite-rsc/client-references";
 import type { NavigationContext } from "vinext/shims/navigation-server";
 import {
   ServerInsertedHTMLContext,
@@ -40,6 +40,7 @@ import {
 import { renderBeforeInteractiveInlineScripts } from "./before-interactive-head.js";
 import {
   createNavigationRuntimeRenderedSearchScript,
+  createNavigationRuntimeRscCompatibilityScript,
   createNavigationRuntimeRscMetadataScript,
   createRscEmbedTransform,
   createTickBufferedTransform,
@@ -58,7 +59,10 @@ import { AppElementsWire, type AppWireElements } from "./app-elements.js";
 import { createInitialBfcacheMaps } from "./app-bfcache-identity.js";
 import { BfcacheIdentityMapContext, ElementsContext, Slot } from "vinext/shims/slot";
 import { AppRouterContext } from "vinext/shims/internal/app-router-context";
-import { createClientReferencePreloader } from "./app-client-reference-preloader.js";
+import {
+  createClientReferencePreloader,
+  resolveRouteClientReferences,
+} from "./app-client-reference-preloader.js";
 import { RSC_FORM_STATE_GLOBAL } from "../client/browser-globals.js";
 import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
 import DefaultGlobalError from "vinext/shims/default-global-error";
@@ -344,6 +348,11 @@ function buildHeadInjectionHtml(
     ),
     scriptNonce,
   );
+  // Rendered with the page, so a cached page keeps the ID of the deployment
+  // that rendered its embedded payload.
+  const compatibilityScript = createNavigationRuntimeRscCompatibilityScript();
+  const rscCompatibilityScript =
+    compatibilityScript === "" ? "" : createInlineScriptTag(compatibilityScript, scriptNonce);
   const formStateScript =
     formState === null
       ? ""
@@ -354,6 +363,7 @@ function buildHeadInjectionHtml(
 
   return (
     rscMetadataScript +
+    rscCompatibilityScript +
     formStateScript +
     buildModulePreloadHtml(bootstrapModuleUrl, scriptNonce) +
     insertedHTML +
@@ -385,6 +395,12 @@ export async function handleSsr(
     /** Out-parameter: filled with accumulated raw RSC bytes when sideStream is consumed. */
     capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
     pprFallbackShellSignal?: AbortSignal;
+    /**
+     * Pattern of the route this render shows, whose client references load
+     * before it starts, or null for a render without a route (a route-miss
+     * 404). Omitted, every client reference loads first.
+     */
+    preloadRoutePattern?: string | null;
     formState?: ReactFormState | null;
     basePath?: string;
     /**
@@ -463,7 +479,14 @@ export async function handleSsr(
       ),
     };
 
-    await clientReferencePreloader.preload();
+    // A render waits for its route's client references, so a cold render
+    // shows the same document as a warm one. A PPR fallback shell aborts on
+    // the next tick, so it loads every reference first.
+    await clientReferencePreloader.preload(
+      options?.pprFallbackShellSignal
+        ? undefined
+        : resolveRouteClientReferences(routeClientReferences, options?.preloadRoutePattern),
+    );
 
     setNavigationContext(ssrNavigationContext);
 

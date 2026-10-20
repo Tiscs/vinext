@@ -24,6 +24,13 @@ export function middleware(request: NextRequest) {
       }),
     );
   }
+  // Middleware cookies must precede the API route's res.appendHeader cookies.
+  // Coverage: tests/pages-router.test.ts
+  if (url.pathname === "/api/append-header") {
+    const res = NextResponse.next();
+    res.cookies.set("mw", "1");
+    return res;
+  }
   if (url.pathname === "/api/edge-request-signal") {
     if (!url.searchParams.has("override")) return NextResponse.next();
     const headers = new Headers(request.headers);
@@ -74,6 +81,48 @@ export function middleware(request: NextRequest) {
   // Redirect /old-page to /about
   if (url.pathname === "/old-page") {
     return NextResponse.redirect(new URL("/about", request.url));
+  }
+
+  // next.config.mjs adds config headers to /external-headers/* and proxies its
+  // before-files, after-files and fallback paths to the local upstream.
+  // Middleware proxies /external-headers/middleware/* there itself.
+  if (url.pathname.startsWith("/external-headers/")) {
+    const upstreamPort = request.headers.get("x-test-upstream-port");
+    const middlewarePath = url.pathname.slice("/external-headers/middleware".length);
+    const response =
+      url.pathname.startsWith("/external-headers/middleware/") && /^\d+$/.test(upstreamPort ?? "")
+        ? NextResponse.rewrite(`http://127.0.0.1:${upstreamPort}${middlewarePath}`)
+        : NextResponse.next();
+    const search = url.searchParams;
+    if (search.has("middleware-cookie")) {
+      response.cookies.set("middleware-cookie", "1", { path: "/" });
+    }
+    if (search.has("middleware-header")) response.headers.set("x-mw-response-header", "1");
+    if (search.has("middleware-cache-control")) {
+      response.headers.set("Cache-Control", "private, max-age=7");
+    }
+    return response;
+  }
+
+  // next.config.mjs adds a config Set-Cookie to these paths. Middleware's own
+  // cookie replaces it, as in Next.js.
+  if (
+    url.pathname === "/config-cookie-page" ||
+    url.pathname === "/config-cookie-redirect" ||
+    url.pathname === "/config-cookie-response"
+  ) {
+    const res =
+      url.pathname === "/config-cookie-redirect"
+        ? NextResponse.redirect(new URL("/about", request.url))
+        : url.pathname === "/config-cookie-response"
+          ? new NextResponse("from middleware")
+          : NextResponse.next();
+    if (url.searchParams.has("middleware-cookie")) {
+      res.cookies.set("middleware-cookie", "1", { path: "/" });
+    }
+    // Next.js ignores an empty middleware Set-Cookie.
+    if (url.searchParams.has("empty-middleware-cookie")) res.headers.set("Set-Cookie", "");
+    return res;
   }
 
   // Redirect /redirect-with-cookies to /about and set cookies on the redirect
@@ -358,6 +407,7 @@ export const config = {
   matcher: [
     "/api/edge-search-params",
     "/api/edge-request-signal",
+    "/api/append-header",
     "/edge-api-rewrite/:path*",
     "/((?!api|_next|favicon\\.ico|mw-object-gated).*)",
     {

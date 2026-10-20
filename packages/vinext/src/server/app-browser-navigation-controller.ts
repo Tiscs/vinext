@@ -19,7 +19,8 @@ import {
   consumeAppRouterScrollIntent,
   type AppRouterScrollIntent,
 } from "vinext/shims/app-router-scroll-state";
-import type { RouteManifest } from "../routing/app-route-graph.js";
+import { withBasePath } from "vinext/shims/url-utils";
+import type { BrowserRouteManifest } from "../routing/browser-route-manifest.js";
 import { stripBasePath } from "../utils/base-path.js";
 import {
   FRESH_APP_NAVIGATION_PAYLOAD_ORIGIN,
@@ -94,8 +95,12 @@ type SameUrlServerActionLifecycleOptions = {
 type BrowserNavigationControllerDeps = {
   basePath?: string;
   commitClientNavigationState?: typeof commitClientNavigationState;
+  // Loads a URL as a new document once the reload-loop guard allows it.
+  navigateDocument?: (href: string, mode: HardNavigationMode) => void;
   performHardNavigation?: (href: string, mode?: HardNavigationMode) => boolean;
-  getRouteManifest?: () => RouteManifest | null;
+  getRouteManifest?: () => BrowserRouteManifest | null;
+  // Starts or joins the RouteManifest load; null once it is loaded.
+  loadRouteManifest?: () => Promise<boolean> | null;
   syncHistoryStatePreviousNextUrl?: (
     previousNextUrl: string | null,
     bfcacheIds?: Readonly<Record<string, string>> | null,
@@ -139,6 +144,7 @@ type BrowserNavigationController = {
     stateRef: BrowserRouterStateRef,
   ): () => void;
   beginPendingBrowserRouterState(): PendingBrowserRouterState;
+  abandonPendingBrowserRouterState(pending: PendingBrowserRouterState | null | undefined): void;
   finalizeNavigation(navId: number, pending: PendingBrowserRouterState | null | undefined): void;
   discardPendingNavigation(visibleState: AppRouterState | null): boolean;
   flushCommittingNavigationUrl(): void;
@@ -220,9 +226,18 @@ export function clearHardNavigationLoopGuard(): void {
   } catch {}
 }
 
+export function navigateDocumentDirectly(href: string, mode: HardNavigationMode): void {
+  if (mode === "replace") {
+    window.location.replace(href);
+  } else {
+    window.location.assign(href);
+  }
+}
+
 function performHardNavigationWithLoopGuard(
   href: string,
   mode: HardNavigationMode = "assign",
+  navigateDocument: (href: string, mode: HardNavigationMode) => void = navigateDocumentDirectly,
 ): boolean {
   const targetHref = normalizeBrowserHref(href);
   const currentHref = normalizeBrowserHref(window.location.href);
@@ -248,11 +263,7 @@ function performHardNavigationWithLoopGuard(
   // can still make forward progress. Only same-target reloads need a persisted
   // guard because they can re-enter this exact recovery path indefinitely.
 
-  if (mode === "replace") {
-    window.location.replace(href);
-  } else {
-    window.location.assign(href);
-  }
+  navigateDocument(href, mode);
   return true;
 }
 
@@ -287,8 +298,12 @@ export function createAppBrowserNavigationController(
   const basePath = deps.basePath ?? "";
   const commitClientNavigationStateImpl =
     deps.commitClientNavigationState ?? commitClientNavigationState;
-  const performHardNavigation = deps.performHardNavigation ?? performHardNavigationWithLoopGuard;
+  const performHardNavigation =
+    deps.performHardNavigation ??
+    ((href: string, mode?: HardNavigationMode) =>
+      performHardNavigationWithLoopGuard(href, mode, deps.navigateDocument));
   const getRouteManifest = deps.getRouteManifest ?? (() => null);
+  const loadRouteManifest = deps.loadRouteManifest ?? (() => null);
   const syncHistoryStatePreviousNextUrl = deps.syncHistoryStatePreviousNextUrl ?? (() => {});
 
   // These are plain module-level variables (inside the controller closure),
@@ -446,6 +461,20 @@ export function createAppBrowserNavigationController(
     pending.settled = true;
     pending.resolve(getBrowserRouterState());
 
+    if (activePendingBrowserRouterState === pending) {
+      activePendingBrowserRouterState = null;
+    }
+  }
+
+  // A started hard navigation leaves its pending state unresolved, like
+  // Next.js's MPA navigation: resolving it would commit the old tree and the
+  // navigation's transition (dropping useTransition's isPending) before unload.
+  function abandonPendingBrowserRouterState(
+    pending: PendingBrowserRouterState | null | undefined,
+  ): void {
+    if (!pending || pending.settled) return;
+
+    pending.settled = true;
     if (activePendingBrowserRouterState === pending) {
       activePendingBrowserRouterState = null;
     }
@@ -660,7 +689,12 @@ export function createAppBrowserNavigationController(
     const currentState = getBrowserRouterState();
     const renderId = allocateRenderId();
     // Await both so a failed response does not leave either rejection unobserved.
-    const [navigationSnapshot] = await Promise.all([pendingNavigationSnapshot, nextElements]);
+    // Approval below reads the RouteManifest, so its load joins them.
+    const [navigationSnapshot, , routeManifestLoaded] = await Promise.all([
+      pendingNavigationSnapshot,
+      nextElements,
+      loadRouteManifest(),
+    ]);
     const pending = await createPendingNavigationCommit({
       currentState,
       nextElements,
@@ -678,6 +712,15 @@ export function createAppBrowserNavigationController(
     // before dispatching so a racing unmount doesn't surface as an
     // initialized-setter error.
     if (!hasBrowserRouterState()) return;
+
+    // Without the RouteManifest the update cannot be classified; reload it.
+    // The snapshot path has basePath stripped.
+    if (routeManifestLoaded === false) {
+      performHardNavigation(
+        withBasePath(createSnapshotPathAndSearch(navigationSnapshot), basePath),
+      );
+      return;
+    }
 
     const approval = approveHmrVisibleCommit({
       currentState: getBrowserRouterState(),
@@ -912,6 +955,22 @@ export function createAppBrowserNavigationController(
   async function renderNavigationPayload(
     options: BrowserNavigationPayloadOptions,
   ): Promise<NavigationPayloadOutcome> {
+    // Approval reads the RouteManifest. Without it the commit cannot be
+    // classified: the navigation that still owns the router loads as a
+    // document instead, and a superseded one commits nothing.
+    const routeManifestLoad = loadRouteManifest();
+    if (routeManifestLoad !== null && !(await routeManifestLoad)) {
+      settlePendingBrowserRouterState(options.pendingRouterState);
+      consumeAppRouterScrollIntent(options.scrollIntent ?? null);
+      if (isCurrentNavigation(options.navId)) {
+        performHardNavigation(
+          options.targetHref,
+          options.historyUpdateMode === "push" ? "assign" : "replace",
+        );
+      }
+      return "no-commit";
+    }
+
     if (options.navId === pendingUserNavigationId) {
       pendingUserNavigationLane = options.operationLane;
     }
@@ -982,13 +1041,20 @@ export function createAppBrowserNavigationController(
       }
 
       if (approval.decision.disposition === "hard-navigate") {
-        settlePendingBrowserRouterState(options.pendingRouterState);
         pendingNavigationFailureTargets.delete(renderId);
         pendingNavigationCommits.delete(renderId);
         consumeAppRouterScrollIntent(options.scrollIntent ?? null);
-        if (performHardNavigation(options.targetHref)) {
+        // Like Next.js's completeHardNavigation, only a push adds a history entry.
+        if (
+          performHardNavigation(
+            options.targetHref,
+            options.historyUpdateMode === "push" ? "assign" : "replace",
+          )
+        ) {
+          abandonPendingBrowserRouterState(options.pendingRouterState);
           return "hard-navigate";
         }
+        settlePendingBrowserRouterState(options.pendingRouterState);
         if (failureTarget) {
           clearAppNavigationFailureTarget(failureTarget);
         }
@@ -1084,6 +1150,18 @@ export function createAppBrowserNavigationController(
     const currentState = actionInitiationState ?? getBrowserRouterState();
     const startedNavigationId = lifecycleOptions?.startedNavigationId ?? activeNavigationId;
     const targetHref = lifecycleOptions?.targetHref ?? window.location.href;
+    const routeManifestLoad = loadRouteManifest();
+    if (routeManifestLoad !== null && !(await routeManifestLoad)) {
+      // The commit cannot be classified without the RouteManifest. An action
+      // that still owns the router reloads, like a hard-navigate decision
+      // below; a superseded one is discarded like a no-commit decision.
+      if (isCurrentNavigation(startedNavigationId)) {
+        performHardNavigation(targetHref);
+        return undefined;
+      }
+      notifyDiscardedServerActionRevalidation(lifecycleOptions);
+      return resolveSameUrlActionReturnValue(returnValue);
+    }
     const {
       approvedCommit,
       decision,
@@ -1155,6 +1233,12 @@ export function createAppBrowserNavigationController(
     // update was skipped due to a superseding navigation. That preserves the
     // existing caller contract; a future Phase 2 router state model could make
     // skipped UI updates observable to the caller without conflating them here.
+    return resolveSameUrlActionReturnValue(returnValue);
+  }
+
+  async function resolveSameUrlActionReturnValue(
+    returnValue: { ok: boolean; data: unknown } | undefined,
+  ): Promise<unknown> {
     if (returnValue) {
       if (!returnValue.ok) {
         // A failed action's thrown value may still be settling.
@@ -1195,6 +1279,7 @@ export function createAppBrowserNavigationController(
     waitForBrowserRouterStateReady,
     attachBrowserRouterState,
     beginPendingBrowserRouterState,
+    abandonPendingBrowserRouterState,
     finalizeNavigation,
     discardPendingNavigation,
     flushCommittingNavigationUrl,
